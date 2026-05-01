@@ -1,0 +1,16 @@
+ASR Benchmark Analysis
+========================================
+
+Best quality: whisper-medium_beam5 (WER=0.0994)
+Fastest: whisper-medium_beam1 (RTF=0.0283)
+
+Total benchmark wall time: 126.43 sec
+Audio augmentations: clean
+
+Full results:
+  whisper-medium_beam5                     WER=0.0994  CER=0.0364  RTF=0.0333  WALL=14.77s  GPU=0MB
+  whisper-medium-int8_beam5                WER=0.0994  CER=0.0371  RTF=0.0391  WALL=17.79s  GPU=0MB
+  whisper-large-v3_beam1                   WER=0.1066  CER=0.0473  RTF=0.0436  WALL=20.99s  GPU=0MB
+  whisper-large-v3_beam5                   WER=0.1066  CER=0.0471  RTF=0.0510  WALL=23.08s  GPU=0MB
+  whisper-medium_beam1                     WER=0.1102  CER=0.0426  RTF=0.0283  WALL=12.72s  GPU=0MB
+  whisper-large-v3-int8_beam5              WER=0.1174  CER=0.0532  RTF=0.0517  WALL=24.66s  GPU=0MB

@@ -1,0 +1,7 @@
+model_name,num_samples,wer,cer,rtf,avg_latency_sec,p50_latency_sec,p95_latency_sec,total_audio_hours,total_inference_sec,gpu_memory_peak_mb,gpu_memory_avg_mb,substitution_rate,deletion_rate,insertion_rate,total_words_ref,substitutions,deletions,insertions,hits,wer_short,count_short,wer_medium,count_medium,wer_long,count_long
+whisper-large-v3_beam1,17,0.1066,0.0473,0.0442,0.8704,0.844,1.2361,0.093,14.8,0.0,0.0,0.0754,0.0216,0.0096,835,63,18,8,754,,0,0.037,4,0.1221,13
+whisper-large-v3_beam5,17,0.1066,0.0471,0.0518,1.0201,0.984,1.4501,0.093,17.34,0.0,0.0,0.0731,0.0228,0.0108,835,61,19,9,755,,0,0.037,4,0.1228,13
+whisper-large-v3-int8_beam5,17,0.1174,0.0532,0.0553,1.0893,1.0425,1.6035,0.093,18.52,0.0,0.0,0.0743,0.0299,0.0132,835,62,25,11,748,,0,0.0517,4,0.1336,13
+whisper-medium_beam1,17,0.1102,0.0426,0.0292,0.5754,0.5648,0.7981,0.093,9.78,0.0,0.0,0.0743,0.0192,0.0168,835,62,16,14,757,,0,0.0652,4,0.1242,13
+whisper-medium_beam5,17,0.0994,0.0364,0.0352,0.6923,0.6713,0.9865,0.093,11.77,0.0,0.0,0.0743,0.0132,0.012,835,62,11,10,762,,0,0.0309,4,0.1175,13
+whisper-medium-int8_beam5,17,0.0994,0.0371,0.041,0.8079,0.8047,1.1298,0.093,13.73,0.0,0.0,0.0707,0.0144,0.0144,835,59,12,12,764,,0,0.0647,4,0.1093,13

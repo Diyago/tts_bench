@@ -1,0 +1,40 @@
+# Data
+data/raw/
+data/processed/
+
+# Results (keep structure, ignore large files)
+results/figures/
+results/per_sample_results.csv
+
+# Models cache
+models/*.pt
+models/*.bin
+models/*.onnx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+*.env
+venv/
+.venv/
+
+# HuggingFace cache
+.cache/
