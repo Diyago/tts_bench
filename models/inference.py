@@ -1298,7 +1298,7 @@ class QwenModel(ASRModel):
 
     def load(self):
         try:
-            from transformers import AutoProcessor, AutoModelForCausalLM
+            from transformers import AutoProcessor, AutoModel
 
             logger.info(f"Loading Qwen Audio/Omni model: {self.model_id}")
 
@@ -1319,9 +1319,18 @@ class QwenModel(ASRModel):
             self._processor = AutoProcessor.from_pretrained(
                 self.model_id, trust_remote_code=True
             )
-            self._model = AutoModelForCausalLM.from_pretrained(
-                self.model_id, **load_kwargs
-            )
+            
+            try:
+                self._model = AutoModel.from_pretrained(
+                    self.model_id, **load_kwargs
+                )
+            except Exception as e:
+                logger.warning(f"AutoModel failed ({e}), trying AutoModelForCausalLM...")
+                from transformers import AutoModelForCausalLM
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    self.model_id, **load_kwargs
+                )
+                
             self._model.eval()
             self._is_loaded = True
             logger.info(f"{self.model_id} loaded successfully")

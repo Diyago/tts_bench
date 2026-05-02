@@ -112,6 +112,12 @@ _tqdm_handler = _TqdmLoggingHandler()
 _tqdm_handler.setLevel(logging.getLevelName(config.LOG_LEVEL))
 _tqdm_handler.setFormatter(logging.Formatter(config.LOG_FORMAT))
 _root.addHandler(_tqdm_handler)
+
+_file_handler = logging.FileHandler(config.RESULTS_DIR / "benchmark.log", mode="w", encoding="utf-8")
+_file_handler.setLevel(logging.getLevelName(config.LOG_LEVEL))
+_file_handler.setFormatter(logging.Formatter(config.LOG_FORMAT))
+_root.addHandler(_file_handler)
+
 _root.setLevel(logging.getLevelName(config.LOG_LEVEL))
 
 # Silence chatty third-party loggers (per-sample spam)
