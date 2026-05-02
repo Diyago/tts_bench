@@ -74,22 +74,29 @@ class ASRModel(abc.ABC):
         """Load the model into memory."""
         pass
 
+    def _record_load_memory(self):
+        """Call this AFTER the model weights are loaded to record GPU footprint.
+        Uses NVML so it works for both PyTorch and CTranslate2 backends.
+        """
+        mem_nvml = _nvml_used_mb()
+        mem_torch = 0.0
+        if torch.cuda.is_available():
+            mem_torch = torch.cuda.memory_allocated() / (1024 ** 2)
+        # Use whichever backend shows more (one of them will be 0 for non-torch models)
+        self._loaded_gpu_mem_mb = max(mem_nvml, mem_torch)
+
     @abc.abstractmethod
     def _transcribe_single(self, audio_path: str) -> str:
         """Transcribe a single audio file. Returns raw text."""
         pass
 
     def transcribe(self, audio_path: str, duration_sec: float = 0.0) -> InferenceResult:
-        """Transcribe with timing and memory tracking."""
+        """Transcribe with timing. GPU memory is measured at load time."""
         if not self._is_loaded:
             self.load()
 
-        # Reset GPU memory tracking (torch allocator – works for PyTorch models)
         if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
-
-        gpu_mem_before = _nvml_used_mb()
 
         start = time.perf_counter()
         text = self._transcribe_single(audio_path)
@@ -97,13 +104,8 @@ class ASRModel(abc.ABC):
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
 
-        # Prefer NVML (works for CTranslate2/faster-whisper too),
-        # fall back to torch allocator for pure-PyTorch models.
-        gpu_mem_nvml = _nvml_used_mb() - gpu_mem_before
-        gpu_mem_torch = 0.0
-        if torch.cuda.is_available():
-            gpu_mem_torch = torch.cuda.max_memory_allocated() / (1024 ** 2)
-        gpu_mem = max(gpu_mem_nvml, gpu_mem_torch)
+        # Use the footprint recorded at load time (accurate for CTranslate2).
+        gpu_mem = getattr(self, "_loaded_gpu_mem_mb", 0.0)
 
         return InferenceResult(
             text=text,
@@ -159,7 +161,13 @@ class FasterWhisperModel(ASRModel):
         self._model = None
 
     def load(self, shared_model=None):
-        """Load the WhisperModel, or reuse a pre-loaded shared instance."""
+        """Load the WhisperModel, or reuse a pre-loaded shared instance.
+
+        Loading strategy:
+          1. Try local HF cache (local_files_only=True) — no network required.
+          2. On cache miss, attempt download from HuggingFace.
+          3. On any network/SSL error, raise with a clear actionable message.
+        """
         from faster_whisper import WhisperModel
 
         if shared_model is not None:
@@ -176,28 +184,94 @@ class FasterWhisperModel(ASRModel):
             f"Loading faster-whisper {self.model_size} "
             f"(compute={self.compute_type}, beam={self.beam_size})"
         )
-        self._model = WhisperModel(
-            self.model_size,
-            device=self.device,
-            compute_type=self.compute_type,
-        )
-        self._is_loaded = True
-        logger.info(f"Model {self.name} loaded successfully")
+
+        common_kwargs = dict(device=self.device, compute_type=self.compute_type)
+
+        # --- 1. Try local cache first (works offline / behind firewall) ------
+        try:
+            logger.info(f"  Trying local HF cache for {self.model_size}...")
+            self._model = WhisperModel(
+                self.model_size,
+                local_files_only=True,
+                **common_kwargs,
+            )
+            self._is_loaded = True
+            self._record_load_memory()
+            logger.info(f"  Loaded {self.name} from local cache (GPU: {self._loaded_gpu_mem_mb:.0f} MB).")
+            return
+        except Exception as cache_err:
+            logger.info(
+                f"  Not in local cache ({type(cache_err).__name__}), "
+                "will attempt download..."
+            )
+
+        # --- 2. Download from HuggingFace ------------------------------------
+        try:
+            self._model = WhisperModel(self.model_size, **common_kwargs)
+            self._is_loaded = True
+            self._record_load_memory()
+            logger.info(f"Model {self.name} downloaded and loaded (GPU: {self._loaded_gpu_mem_mb:.0f} MB).")
+        except Exception as dl_err:
+            err_str = str(dl_err)
+            if any(kw in err_str.lower() for kw in ("ssl", "timeout", "connection", "proxy")):
+                raise RuntimeError(
+                    f"Network/SSL error while downloading faster-whisper '{self.model_size}'.\n"
+                    "Possible fixes:\n"
+                    "  1. Set HF_HUB_OFFLINE=1 and ensure the model is already cached:\n"
+                    "       set HF_HUB_OFFLINE=1 (Windows) or export HF_HUB_OFFLINE=1\n"
+                    "  2. Download the model manually:\n"
+                    f"       huggingface-cli download Systran/faster-whisper-{self.model_size}\n"
+                    "  3. Use a VPN or configure HF_ENDPOINT for a mirror.\n"
+                    f"  Original error: {dl_err}"
+                ) from dl_err
+            raise
+
+    # Class-level flag so the numpy/onnxruntime warning prints only once
+    _vad_broken_warned: bool = False
 
     def _transcribe_single(self, audio_path: str) -> str:
-        segments, info = self._model.transcribe(
-            audio_path,
+        common_kwargs = dict(
             beam_size=self.beam_size,
             language=self.language,
-            vad_filter=self.vad_filter,
+            without_timestamps=True,
+        )
+        vad_kwargs = dict(
+            vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=500,
                 speech_pad_ms=200,
             ),
-            without_timestamps=True,
         )
-        text = " ".join(seg.text.strip() for seg in segments)
-        return text
+
+        if self.vad_filter:
+            try:
+                segments, _ = self._model.transcribe(
+                    audio_path, **common_kwargs, **vad_kwargs
+                )
+                return " ".join(seg.text.strip() for seg in segments)
+            except Exception as e:
+                err = str(e)
+                # onnxruntime compiled against NumPy 1.x breaks on NumPy 2.x
+                if "onnxruntime" in err or "_ARRAY_API" in err or "VAD" in err:
+                    if not FasterWhisperModel._vad_broken_warned:
+                        logger.warning(
+                            "VAD filter failed (onnxruntime/NumPy 2.x incompatibility). "
+                            "Disabling VAD for ALL remaining samples.\n"
+                            "Permanent fix: pip install \"numpy<2\" "
+                            "OR pip install --upgrade onnxruntime"
+                        )
+                        FasterWhisperModel._vad_broken_warned = True
+                    # Permanently disable VAD on this instance to prevent
+                    # re-triggering the broken onnxruntime import
+                    self.vad_filter = False
+                    # Fall through to no-VAD transcription below
+                else:
+                    raise
+
+        # No-VAD path (either vad_filter=False or VAD broke above)
+        segments, _ = self._model.transcribe(audio_path, **common_kwargs, vad_filter=False)
+        return " ".join(seg.text.strip() for seg in segments)
+
 
     def unload(self):
         del self._model
@@ -242,14 +316,62 @@ class GigaAMModel(ASRModel):
             import gigaam
 
             logger.info(f"Loading GigaAM model: {self.model_version}")
-            self._model = gigaam.load_model(self.model_version)
+
+            # PyTorch 2.6 switched torch.load default to weights_only=True.
+            # Some GigaAM checkpoints include OmegaConf objects, which require
+            # allowlisting under the safe unpickler. We do a *scoped* allowlist
+            # only around the GigaAM load call (no global torch.load monkeypatch).
+            try:
+                from torch.serialization import safe_globals as _safe_globals
+                from typing import Any as _Any
+                from omegaconf import DictConfig as _DictConfig, ListConfig as _ListConfig
+                from omegaconf.base import ContainerMetadata as _ContainerMetadata
+
+                with _safe_globals([_Any, _DictConfig, _ListConfig, _ContainerMetadata]):
+                    self._model = gigaam.load_model(self.model_version)
+                logger.info("  GigaAM: loaded with torch.serialization.safe_globals allowlist")
+            except Exception as _safe_err:
+                # Older torch may not have safe_globals, or omega conf may be absent.
+                # Best-effort fallback: extend allowlist globally for this process.
+                try:
+                    import torch.serialization as _ts
+                    from typing import Any as _Any
+                    from omegaconf import DictConfig as _DictConfig, ListConfig as _ListConfig
+                    from omegaconf.base import ContainerMetadata as _ContainerMetadata
+                    _ts.add_safe_globals([_Any, _DictConfig, _ListConfig, _ContainerMetadata])
+                    self._model = gigaam.load_model(self.model_version)
+                    logger.info("  GigaAM: loaded after add_safe_globals allowlist")
+                except Exception:
+                    # Last-resort compatibility fallback (unsafe): force weights_only=False
+                    # only for the duration of gigaam.load_model(). This can execute
+                    # arbitrary code embedded in the checkpoint — do this only if you
+                    # trust the checkpoint source.
+                    import torch as _torch
+                    _orig_load = _torch.load
+
+                    def _patched_load(*a, **kw):
+                        kw.setdefault("weights_only", False)
+                        return _orig_load(*a, **kw)
+
+                    logger.warning(
+                        "  GigaAM: safe loading failed; retrying with torch.load(weights_only=False). "
+                        "Only safe if you trust the checkpoint."
+                    )
+                    _torch.load = _patched_load
+                    try:
+                        self._model = gigaam.load_model(self.model_version)
+                        logger.info("  GigaAM: loaded with weights_only=False fallback")
+                    finally:
+                        _torch.load = _orig_load
+
             self._model.eval()
 
             if self.device == "cuda" and torch.cuda.is_available():
                 self._model = self._model.cuda()
 
             self._is_loaded = True
-            logger.info(f"GigaAM {self.model_version} loaded successfully")
+            self._record_load_memory()
+            logger.info(f"GigaAM {self.model_version} loaded successfully (GPU: {self._loaded_gpu_mem_mb:.0f} MB)")
 
         except ImportError:
             logger.error(
@@ -263,11 +385,67 @@ class GigaAMModel(ASRModel):
             raise
 
     def _transcribe_single(self, audio_path: str) -> str:
-        result = self._model.transcribe(audio_path)
+        try:
+            result = self._model.transcribe(audio_path)
+        except Exception as e:
+            msg = str(e)
+            if "Too long wav file" in msg:
+                # GigaAM requires a special API for long audio. In some installs,
+                # transcribe_longform depends on pyannote.audio (not always present).
+                if hasattr(self._model, "transcribe_longform"):
+                    try:
+                        result = self._model.transcribe_longform(audio_path)
+                    except Exception as lf_err:
+                        # Fallback: chunk audio and run regular transcribe().
+                        # This avoids extra diarization deps.
+                        if "pyannote.audio" not in str(lf_err):
+                            raise
+                        result = self._transcribe_chunked(audio_path)
+                else:
+                    result = self._transcribe_chunked(audio_path)
+            else:
+                raise
+
         # transcribe() returns either a string or a TranscriptionResult
-        if hasattr(result, 'text'):
+        if hasattr(result, "text"):
             return result.text
         return str(result)
+
+    def _transcribe_chunked(self, audio_path: str, chunk_sec: float = 15.0, overlap_sec: float = 0.5) -> str:
+        """Chunk long audio into smaller windows and transcribe sequentially."""
+        import tempfile
+        from pathlib import Path
+        import numpy as _np
+        import soundfile as _sf
+
+        audio, sr = _sf.read(audio_path, dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        audio = _np.asarray(audio, dtype=_np.float32)
+
+        chunk_len = max(1, int(chunk_sec * sr))
+        overlap = max(0, int(overlap_sec * sr))
+        step = max(1, chunk_len - overlap)
+
+        texts: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="gigaam_chunks_") as td:
+            td_path = Path(td)
+            idx = 0
+            for start in range(0, len(audio), step):
+                end = min(len(audio), start + chunk_len)
+                if end - start < int(0.25 * sr):
+                    break
+                chunk = audio[start:end]
+                chunk_path = td_path / f"chunk_{idx:04d}.wav"
+                _sf.write(str(chunk_path), chunk, sr)
+                r = self._model.transcribe(str(chunk_path))
+                t = r.text if hasattr(r, "text") else str(r)
+                t = (t or "").strip()
+                if t:
+                    texts.append(t)
+                idx += 1
+
+        return " ".join(texts).strip()
 
     def unload(self):
         del self._model
@@ -513,29 +691,33 @@ class Gemma3nModel(ASRModel):
 
 
 # ===============================================================
-# Gemma 4 (Google: next-gen multimodal with audio)
+# Phi-4 Multimodal (Microsoft)
 # ===============================================================
 
-class Gemma4Model(ASRModel):
+class Phi4Model(ASRModel):
+    """Phi-4-multimodal-instruct (Microsoft) for ASR.
+
+    - 5.6B parameters, multimodal (text + vision + audio)
+    - Uses AutoModelForCausalLM with trust_remote_code=True
+    - Audio loaded via soundfile as (array, samplerate) tuple
+    - Audio languages: EN, ZH, DE, FR, IT, JA, ES, PT
+    - Russian is NOT officially supported for audio but may work
+
+    Requires:
+        pip install transformers torch soundfile accelerate
+
+    VRAM: ~4-5 GB in bfloat16 on GPU.
     """
-    Gemma 4: Google's next-generation multimodal model with native audio.
 
-    Successor to Gemma 3n, with improved audio understanding capabilities.
-    Supports text, image, video, and audio input natively.
-    Available in multiple sizes; we use the instruction-tuned variant.
-
-    Requires: transformers >= 4.55.0
-    Model: google/gemma-4-12b-it (or smaller variants)
-
-    Note: Like Gemma 3n, this is a general-purpose multimodal model.
-    We prompt it for transcription, which is useful for quality comparison.
-    VRAM: ~8-10 GB with 4-bit quantization (12b variant).
-    """
+    _USER = "<|user|>"
+    _ASST = "<|assistant|>"
+    _END  = "<|end|>"
+    _ASR_PROMPT = "Transcribe the audio clip into text."
 
     def __init__(
         self,
-        name: str = "gemma_4",
-        model_id: str = "google/gemma-4-12b-it",
+        name: str = "phi4_multimodal",
+        model_id: str = "microsoft/Phi-4-multimodal-instruct",
         device: str = "cuda",
         use_4bit: bool = True,
     ):
@@ -544,92 +726,174 @@ class Gemma4Model(ASRModel):
         self.use_4bit = use_4bit
         self._model = None
         self._processor = None
+        self._generation_config = None
 
     def load(self):
         try:
-            from transformers import AutoProcessor, AutoModelForCausalLM
+            from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
 
-            logger.info(f"Loading Gemma 4: {self.model_id}")
-
-            load_kwargs = {
-                "device_map": "auto",
-                "trust_remote_code": True,
-            }
-
-            if self.use_4bit:
-                from transformers import BitsAndBytesConfig
-                load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                )
-                logger.info("Using 4-bit quantization for Gemma 4")
-            else:
-                load_kwargs["torch_dtype"] = torch.bfloat16
-
-            self._model = AutoModelForCausalLM.from_pretrained(
-                self.model_id, **load_kwargs
-            ).eval()
+            logger.info(f"Loading Phi-4 Multimodal: {self.model_id}")
 
             self._processor = AutoProcessor.from_pretrained(
                 self.model_id, trust_remote_code=True
             )
 
+            # IMPORTANT: Phi4MM remote code calls Tensor.item() during __init__.
+            # If transformers enables "meta" initialization (via low_cpu_mem_usage /
+            # accelerate dispatch), it will crash. We therefore default to
+            # low_cpu_mem_usage=False unless we're using a GPU device_map.
+            load_kwargs = dict(
+                trust_remote_code=True,
+                low_cpu_mem_usage=False,
+                device_map=None,
+                _fast_init=False,  # avoid meta/empty-weight fast init paths
+            )
+            if torch.cuda.is_available():
+                # Keep VRAM under ~6GB: require 4-bit quantization for GPU.
+                if self.use_4bit:
+                    try:
+                        from transformers import BitsAndBytesConfig
+
+                        load_kwargs["device_map"] = "cuda"
+                        load_kwargs["low_cpu_mem_usage"] = True
+                        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=torch.bfloat16,
+                        )
+                        # torch_dtype is ignored with some quant configs; keep it explicit.
+                        load_kwargs["torch_dtype"] = torch.bfloat16
+                        logger.info("Phi-4: using 4-bit quantization (bitsandbytes) to cap VRAM")
+                    except Exception as q_err:
+                        # bitsandbytes is often unavailable on Windows. To honor the
+                        # <=6GB VRAM constraint, fall back to CPU instead of GPU bf16.
+                        load_kwargs["torch_dtype"] = torch.float32
+                        load_kwargs["_attn_implementation"] = "eager"
+                        logger.warning(
+                            f"Phi-4: 4-bit quantization unavailable ({type(q_err).__name__}). "
+                            "Falling back to CPU to keep VRAM <= 6GB."
+                        )
+                else:
+                    load_kwargs["device_map"] = "cuda"
+                    load_kwargs["low_cpu_mem_usage"] = True
+                    load_kwargs["torch_dtype"] = "auto"
+                try:
+                    import flash_attn  # noqa: F401
+                    load_kwargs["_attn_implementation"] = "flash_attention_2"
+                except ImportError:
+                    load_kwargs["_attn_implementation"] = "eager"
+            else:
+                load_kwargs["torch_dtype"] = torch.float32
+                load_kwargs["_attn_implementation"] = "eager"
+
+            # Force default device away from "meta" during init.
+            # Some transformers/accelerate paths can leave a global meta-device
+            # context active; Phi4MM remote code calls Tensor.item() in __init__
+            # which crashes on meta tensors.
+            # PyTorch 2.6+ requires explicit handling to avoid meta tensors.
+            _get_default_device = getattr(torch, "get_default_device", None)
+            _set_default_device = getattr(torch, "set_default_device", None)
+            _orig_default = _get_default_device() if callable(_get_default_device) else None
+            if callable(_set_default_device):
+                _set_default_device("cpu")
+            
+            # Disable meta device context entirely for PyTorch 2.6+
+            _has_set_default_dtype = hasattr(torch, "set_default_dtype")
+            _orig_dtype = None
+            if _has_set_default_dtype:
+                try:
+                    _orig_dtype = torch.get_default_dtype()
+                    torch.set_default_dtype(torch.float32)
+                except Exception:
+                    _has_set_default_dtype = False
+            
+            try:
+                # Load without device_map first to avoid meta tensors
+                # Then manually move to target device
+                load_kwargs_no_map = {k: v for k, v in load_kwargs.items() if k != "device_map"}
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    self.model_id, **load_kwargs_no_map
+                ).eval()
+                
+                # Move to target device manually
+                if torch.cuda.is_available() and self.device == "cuda":
+                    self._model = self._model.cuda()
+            finally:
+                if callable(_set_default_device) and _orig_default is not None:
+                    try:
+                        _set_default_device(str(_orig_default))
+                    except Exception:
+                        pass
+                if _has_set_default_dtype and _orig_dtype is not None:
+                    try:
+                        torch.set_default_dtype(_orig_dtype)
+                    except Exception:
+                        pass
+
+            # If we ended up on CPU, ensure weights are actually materialized there.
+            # (When device_map isn't provided, HF loads to CPU by default.)
+            if not torch.cuda.is_available() or load_kwargs.get("device_map") != "cuda":
+                self._model = self._model.to("cpu")
+
+            self._generation_config = GenerationConfig.from_pretrained(self.model_id)
+
             self._is_loaded = True
-            logger.info(f"Gemma 4 loaded successfully")
+            self._record_load_memory()
+            logger.info(
+                f"Phi-4 Multimodal loaded (GPU: {self._loaded_gpu_mem_mb:.0f} MB)"
+            )
 
         except ImportError as e:
             logger.error(
-                f"Gemma 4 dependencies missing: {e}\n"
-                "Install with: pip install -U 'transformers>=4.55.0' bitsandbytes"
+                f"Phi-4 dependencies missing: {e}\n"
+                "Install with:\n"
+                "  pip install transformers torch soundfile accelerate"
             )
             raise
+        except RuntimeError as e:
+            # Known failure mode on some Windows + PyTorch 2.6 setups with Phi4MM remote code.
+            if "meta tensors" in str(e):
+                raise RuntimeError(
+                    "Phi-4 Multimodal failed to initialize due to a meta-tensor init path "
+                    "(Torch 2.6 + remote code incompatibility).\n"
+                    "Pragmatic fixes:\n"
+                    "  - Prefer another multimodal model (e.g. gemma-3n) OR\n"
+                    "  - Downgrade PyTorch to 2.5.1 for this model.\n"
+                    f"Original error: {e}"
+                ) from e
+            raise
         except Exception as e:
-            logger.error(f"Failed to load Gemma 4: {e}")
+            logger.error(f"Failed to load Phi-4: {e}")
             raise
 
     def _transcribe_single(self, audio_path: str) -> str:
-        import librosa
+        import soundfile as sf
 
-        # Load audio as float32 numpy array at 16kHz
-        audio_data, sr = librosa.load(audio_path, sr=16000, mono=True)
+        audio, samplerate = sf.read(audio_path)
 
-        # Build chat message with audio input
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio", "audio": audio_data},
-                    {
-                        "type": "text",
-                        "text": (
-                            "Transcribe the speech in this audio exactly as spoken. "
-                            "Output only the transcription text, nothing else. "
-                            "The language is Russian."
-                        ),
-                    },
-                ],
-            }
-        ]
+        prompt = (
+            f"{self._USER}<|audio_1|>{self._ASR_PROMPT}"
+            f"{self._END}{self._ASST}"
+        )
 
-        inputs = self._processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
+        inputs = self._processor(
+            text=prompt,
+            audios=[(audio, samplerate)],
             return_tensors="pt",
         ).to(self._model.device)
 
         input_len = inputs["input_ids"].shape[-1]
 
         with torch.inference_mode():
-            generation = self._model.generate(
+            generate_ids = self._model.generate(
                 **inputs,
                 max_new_tokens=256,
-                do_sample=False,
+                generation_config=self._generation_config,
             )
 
-        output_tokens = generation[0][input_len:]
-        text = self._processor.decode(output_tokens, skip_special_tokens=True)
+        output_tokens = generate_ids[0][input_len:]
+        text = self._processor.decode(
+            output_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
         return text.strip()
 
     def unload(self):
@@ -637,8 +901,8 @@ class Gemma4Model(ASRModel):
         del self._processor
         self._model = None
         self._processor = None
+        self._generation_config = None
         super().unload()
-
 
 # ===============================================================
 # NeMo Conformer (NVIDIA)
@@ -672,23 +936,71 @@ class NeMoConformerModel(ASRModel):
         self.model_name = model_name
         self._model = None
 
+    @staticmethod
+    def _suppress_nemo_spam():
+        """Silence NeMo's per-sample dataloader / pretokenize / train-config spam."""
+        import logging as _log
+        import warnings as _warn
+        
+        # Set Lhotse dataloader logger to CRITICAL to suppress all dataloader warnings
+        for _name in (
+            "nemo_logging",
+            "nemo.collections.asr",
+            "nemo.utils",
+            "nemo.core",
+            "lhotse",
+            "lhotse.cut",
+            "lhotse.dataset",
+            "lhotse.dataloader",
+            "root",
+        ):
+            _lg = _log.getLogger(_name)
+            _lg.setLevel(_log.CRITICAL)  # CRITICAL is higher than ERROR
+            _lg.propagate = False
+            # Disable all handlers for this logger
+            _lg.handlers = []
+        
+        # Filter warnings
+        _warn.filterwarnings("ignore", message=".*If you intend to do training.*")
+        _warn.filterwarnings("ignore", message=".*If you intend to do validation.*")
+        _warn.filterwarnings("ignore", message=".*Please call the ModelPT.setup_test_data.*")
+        _warn.filterwarnings("ignore", message=".*The following configuration keys are ignored.*")
+        _warn.filterwarnings("ignore", message=".*You are using a non-tarred dataset.*")
+        _warn.filterwarnings("ignore", message=".*CTC decoding strategy.*")
+        _warn.filterwarnings("ignore", message=".*Megatron num_microbatches_calculator.*")
+        _warn.filterwarnings("ignore", message=".*Found existing object.*")
+        _warn.filterwarnings("ignore", message=".*Re-using file from.*")
+        _warn.filterwarnings("ignore", message=".*Instantiating model from pre-trained.*")
+        _warn.filterwarnings("ignore", message=".*Tokenizer.*initialized.*")
+
     def load(self):
         try:
             import nemo.collections.asr as nemo_asr
 
+            self._suppress_nemo_spam()
             logger.info(f"Loading NeMo Conformer: {self.model_name}")
 
-            # NeMo models are loaded from pre-trained checkpoints
-            self._model = nemo_asr.models.ASRModel.from_pretrained(
-                model_name=self.model_name
-            )
-
-            if self.device == "cuda" and torch.cuda.is_available():
-                self._model = self._model.cuda()
-
-            self._model.eval()
+            # NeMo prints [NeMo I/W ...] directly to stdout/stderr during load.
+            # Redirect both to suppress the spam.
+            import io as _io
+            import sys as _sys
+            _old_stdout = _sys.stdout
+            _old_stderr = _sys.stderr
+            _sys.stdout = _io.StringIO()
+            _sys.stderr = _io.StringIO()
+            try:
+                self._model = nemo_asr.models.ASRModel.from_pretrained(
+                    model_name=self.model_name
+                )
+                if self.device == "cuda" and torch.cuda.is_available():
+                    self._model = self._model.cuda()
+                self._model.eval()
+            finally:
+                _sys.stdout = _old_stdout
+                _sys.stderr = _old_stderr
             self._is_loaded = True
-            logger.info(f"NeMo Conformer {self.model_name} loaded successfully")
+            self._record_load_memory()
+            logger.info(f"NeMo Conformer {self.model_name} loaded successfully (GPU: {self._loaded_gpu_mem_mb:.0f} MB)")
 
         except ImportError:
             logger.error(
@@ -701,8 +1013,25 @@ class NeMoConformerModel(ASRModel):
             raise
 
     def _transcribe_single(self, audio_path: str) -> str:
-        # NeMo's transcribe() accepts a list of paths and returns a list of strings
-        results = self._model.transcribe([audio_path])
+        self._suppress_nemo_spam()
+        # Use greedy_batch for speed (NeMo warns about 'greedy' being slower)
+        try:
+            self._model.change_decoding_strategy("greedy_batch")
+        except Exception:
+            pass
+        # NeMo's internal logger prints [NeMo W/I ...] directly to stdout/stderr,
+        # bypassing Python logging. Redirect both during transcribe().
+        import io as _io
+        import sys as _sys
+        _old_stdout = _sys.stdout
+        _old_stderr = _sys.stderr
+        _sys.stdout = _io.StringIO()
+        _sys.stderr = _io.StringIO()
+        try:
+            results = self._model.transcribe([audio_path])
+        finally:
+            _sys.stdout = _old_stdout
+            _sys.stderr = _old_stderr
         # Handle both old-style (list of str) and new-style (Hypothesis objects)
         if results and len(results) > 0:
             result = results[0]
@@ -749,26 +1078,129 @@ class SileroSTTModel(ASRModel):
         self._split_into_batches = None
 
     def load(self):
-        try:
-            logger.info(f"Loading Silero STT (language={self.language})")
+        import shutil
+        # Silero hubconf expects a small allowlist of language codes ("ru", "en", ...).
+        # Normalize user/config input like "RU", "ru-RU", "ru_RU" → "ru".
+        lang = (self.language or "ru").strip().lower().replace("_", "-")
+        if "-" in lang:
+            lang = lang.split("-", 1)[0]
+        self.language = lang or "ru"
 
-            model, decoder, read_batch, split_into_batches, _, _ = torch.hub.load(
-                repo_or_dir='snakers4/silero-models',
-                model='silero_stt',
-                language=self.language,
-                device=torch.device(self.device if torch.cuda.is_available() else 'cpu'),
-            )
+        logger.info(f"Loading Silero STT (language={self.language})")
+        device = torch.device(self.device if torch.cuda.is_available() else "cpu")
 
-            self._model = model
-            self._decoder = decoder
-            self._read_batch = read_batch
-            self._split_into_batches = split_into_batches
-            self._is_loaded = True
-            logger.info("Silero STT loaded successfully")
+        # The master branch cache has a stale hubconf.py that tries to import
+        # silero_denoise from an older v0.4.1 cache → ImportError.
+        # Clear both bad caches before loading.
+        hub_dir = torch.hub.get_dir()
+        for bad_cache in [
+            "snakers4_silero-models_master",
+            "snakers4_silero-models_v0.3.0",
+            "snakers4_silero-models_v0.4.1",
+        ]:
+            bad_path = Path(hub_dir) / bad_cache
+            if bad_path.exists():
+                shutil.rmtree(bad_path, ignore_errors=True)
+                logger.info(f"  Cleared stale Silero cache: {bad_path.name}")
 
-        except Exception as e:
-            logger.error(f"Failed to load Silero STT: {e}")
-            raise
+        # Load pinned v0.4.1 which has stable 6-return-value API for Russian
+        last_err = None
+        for repo in ["snakers4/silero-models:v0.4.1"]:
+            try:
+                logger.info(f"  Trying Silero repo: {repo}")
+                try:
+                    # Preferred path: pass language explicitly.
+                    result = torch.hub.load(
+                        repo_or_dir=repo,
+                        model="silero_stt",
+                        language=self.language,
+                        device=device,
+                        trust_repo=True,
+                    )
+                except AssertionError as _lang_err:
+                    # Some hubconf revisions have different language allowlists.
+                    # Retry without language param and let silero pick its default.
+                    logger.info(
+                        f"  {repo}: language={self.language!r} rejected; retrying without language"
+                    )
+                    result = torch.hub.load(
+                        repo_or_dir=repo,
+                        model="silero_stt",
+                        device=device,
+                        trust_repo=True,
+                    )
+                # v0.4.1 returns (model, decoder, read_batch, split_into_batches, _, _)
+                if isinstance(result, (list, tuple)) and len(result) >= 4:
+                    model, decoder, read_batch, split_into_batches = result[:4]
+                    self._read_batch = read_batch
+                    self._split_into_batches = split_into_batches
+                elif isinstance(result, (list, tuple)) and len(result) == 3:
+                    model, decoder, utils = result
+                    self._read_batch = getattr(utils, "read_batch", None) or utils[0]
+                    self._split_into_batches = getattr(utils, "split_into_batches", None) or utils[1]
+                else:
+                    raise RuntimeError(f"Unexpected Silero return signature: {type(result)}, len={len(result)}")
+
+                self._model = model
+                self._decoder = decoder
+                self._is_loaded = True
+                self._record_load_memory()
+                logger.info(
+                    f"Silero STT loaded from {repo} "
+                    f"(GPU: {self._loaded_gpu_mem_mb:.0f} MB)"
+                )
+                return  # success
+            except Exception as e:
+                # If language is invalid (AssertionError), force "ru" and retry once.
+                if isinstance(e, AssertionError) and self.language != "ru":
+                    logger.info(
+                        f"  {repo} failed: invalid language={self.language!r}; retrying with 'ru'"
+                    )
+                    self.language = "ru"
+                    try:
+                        result = torch.hub.load(
+                            repo_or_dir=repo,
+                            model="silero_stt",
+                            language=self.language,
+                            device=device,
+                            trust_repo=True,
+                        )
+                        if isinstance(result, (list, tuple)) and len(result) >= 4:
+                            model, decoder, read_batch, split_into_batches = result[:4]
+                            self._read_batch = read_batch
+                            self._split_into_batches = split_into_batches
+                        elif isinstance(result, (list, tuple)) and len(result) == 3:
+                            model, decoder, utils = result
+                            self._read_batch = getattr(utils, "read_batch", None) or utils[0]
+                            self._split_into_batches = getattr(utils, "split_into_batches", None) or utils[1]
+                        else:
+                            raise RuntimeError(
+                                f"Unexpected Silero return signature: {type(result)}, len={len(result)}"
+                            )
+                        self._model = model
+                        self._decoder = decoder
+                        self._is_loaded = True
+                        self._record_load_memory()
+                        logger.info(
+                            f"Silero STT loaded from {repo} "
+                            f"(GPU: {self._loaded_gpu_mem_mb:.0f} MB)"
+                        )
+                        return
+                    except Exception as e2:
+                        logger.info(f"  {repo} retry failed: {type(e2).__name__}: {e2}")
+                        last_err = e2
+                        continue
+
+                logger.info(f"  {repo} failed: {type(e).__name__}: {e}")
+                last_err = e
+
+        logger.error(
+            f"All Silero repo versions failed. Last error: {last_err}\n"
+            "Tip: manually clear cache:\n"
+            f"  Remove-Item -Recurse -Force '{hub_dir}\\snakers4_silero-models_v0.4.1'"
+        )
+        raise RuntimeError(f"Failed to load Silero STT: {last_err}") from last_err
+
 
     def _transcribe_single(self, audio_path: str) -> str:
         import torchaudio
@@ -785,19 +1217,19 @@ class SileroSTTModel(ASRModel):
         device = torch.device(self.device if torch.cuda.is_available() else 'cpu')
         waveform = waveform.to(device)
 
-        # Transcribe
+        # Transcribe using Silero's model directly
         with torch.inference_mode():
+            # Get model output (logits/probs)
             output = self._model(waveform)
-
-        # Decode
-        if self._decoder is not None:
-            text = self._decoder(output[0])
-        else:
-            # Fallback: greedy decode
-            text = ""
+            
+            # Simple greedy decode
             if hasattr(output, 'argmax'):
-                indices = output.argmax(dim=-1)
-                text = str(indices)
+                indices = output.argmax(dim=-1).squeeze()
+                # Silero uses a specific alphabet mapping
+                # For now, just return the indices as a string to see what we get
+                text = str(indices.tolist())
+            else:
+                text = str(output)
 
         return text if isinstance(text, str) else str(text)
 
@@ -821,8 +1253,9 @@ def create_models(
     include_whisper: bool = True,
     include_gigaam: bool = True,
     include_vibevoice: bool = False,
+    include_vibevoice_4bit: bool = False,
     include_gemma: bool = False,
-    include_gemma4: bool = False,
+    include_phi4: bool = False,
     include_nemo: bool = False,
     include_silero: bool = False,
     whisper_configs: Optional[dict] = None,
@@ -833,9 +1266,10 @@ def create_models(
     Args:
         include_whisper: Include faster-whisper models
         include_gigaam: Include GigaAM-v3 models
-        include_vibevoice: Include VibeVoice-ASR (needs ~14GB VRAM, use 4bit)
+        include_vibevoice: Include VibeVoice-ASR (needs ~14GB VRAM)
+        include_vibevoice_4bit: Include VibeVoice-ASR with 4-bit quantization (~6GB VRAM)
         include_gemma: Include Gemma 3n E4B (multimodal with audio)
-        include_gemma4: Include Gemma 4 (next-gen multimodal with audio)
+        include_phi4: Include Phi-4 Multimodal (Microsoft, 5.6B)
         include_nemo: Include NeMo Conformer (NVIDIA)
         include_silero: Include Silero STT (lightweight Russian)
     """
@@ -887,24 +1321,16 @@ def create_models(
                 secondary.load = types.MethodType(_shared_load, secondary)
             models.extend(group)
 
-    # --- GigaAM-v3 ---------------------------------------
+    # --- GigaAM ---------------------------------------
     if include_gigaam:
-        # v3_ctc: raw text output, best for fair WER comparison
-        models.append(
-            GigaAMModel(
-                name="gigaam_v3_ctc",
-                model_version="v3_ctc",
-                device=cfg.GIGAAM_CONFIG["device"],
+        for ver in cfg.GIGAAM_CONFIG["model_versions"]:
+            models.append(
+                GigaAMModel(
+                    name=f"gigaam_{ver}",
+                    model_version=ver,
+                    device=cfg.GIGAAM_CONFIG["device"],
+                )
             )
-        )
-        # v3_e2e_rnnt: end-to-end with punctuation (to show full capability)
-        models.append(
-            GigaAMModel(
-                name="gigaam_v3_e2e_rnnt",
-                model_version="v3_e2e_rnnt",
-                device=cfg.GIGAAM_CONFIG["device"],
-            )
-        )
 
     # --- VibeVoice-ASR ------------------------------------
     if include_vibevoice:
@@ -913,7 +1339,16 @@ def create_models(
                 name="vibevoice_asr",
                 model_path="microsoft/VibeVoice-ASR",
                 device="cuda",
-                use_4bit=True,  # 4-bit quant to fit 12GB VRAM
+                use_4bit=False,  # Full precision (needs ~14GB VRAM)
+            )
+        )
+    if include_vibevoice_4bit:
+        models.append(
+            VibeVoiceModel(
+                name="vibevoice_asr_4bit",
+                model_path="microsoft/VibeVoice-ASR",
+                device="cuda",
+                use_4bit=True,  # 4-bit quant to fit ~6GB VRAM
             )
         )
 
@@ -927,16 +1362,17 @@ def create_models(
             )
         )
 
-    # --- Gemma 4 ------------------------------------------
-    if include_gemma4:
+    # --- Phi-4 Multimodal ---------------------------------
+    if include_phi4:
         models.append(
-            Gemma4Model(
-                name="gemma_4",
-                model_id=cfg.GEMMA4_CONFIG["model_id"],
-                device=cfg.GEMMA4_CONFIG["device"],
-                use_4bit=cfg.GEMMA4_CONFIG.get("use_4bit", True),
+            Phi4Model(
+                name="phi4_multimodal",
+                model_id=cfg.PHI4_CONFIG["model_id"],
+                device=cfg.PHI4_CONFIG["device"],
+                use_4bit=cfg.PHI4_CONFIG.get("use_4bit", True),
             )
         )
+
 
     # --- NeMo Conformer -----------------------------------
     if include_nemo:

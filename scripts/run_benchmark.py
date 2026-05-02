@@ -21,6 +21,7 @@ import random
 import re
 import sys
 import time
+import warnings
 import zlib
 from pathlib import Path
 
@@ -28,6 +29,30 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+
+# Suppress NeMo/Lhotse spam at module level before any imports
+logging.getLogger("lhotse").setLevel(logging.CRITICAL)
+logging.getLogger("lhotse.cut").setLevel(logging.CRITICAL)
+logging.getLogger("lhotse.dataset").setLevel(logging.CRITICAL)
+logging.getLogger("lhotse.dataloader").setLevel(logging.CRITICAL)
+logging.getLogger("nemo_logging").setLevel(logging.CRITICAL)
+logging.getLogger("nemo").setLevel(logging.CRITICAL)
+logging.getLogger("nemo.collections").setLevel(logging.CRITICAL)
+logging.getLogger("nemo.collections.asr").setLevel(logging.CRITICAL)
+logging.getLogger("nemo.utils").setLevel(logging.CRITICAL)
+logging.getLogger("nemo.core").setLevel(logging.CRITICAL)
+logging.getLogger("root").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", message=".*If you intend to do training.*")
+warnings.filterwarnings("ignore", message=".*If you intend to do validation.*")
+warnings.filterwarnings("ignore", message=".*Please call the ModelPT.setup_test_data.*")
+warnings.filterwarnings("ignore", message=".*The following configuration keys are ignored.*")
+warnings.filterwarnings("ignore", message=".*You are using a non-tarred dataset.*")
+warnings.filterwarnings("ignore", message=".*CTC decoding strategy.*")
+warnings.filterwarnings("ignore", message=".*Megatron num_microbatches_calculator.*")
+warnings.filterwarnings("ignore", message=".*Found existing object.*")
+warnings.filterwarnings("ignore", message=".*Re-using file from.*")
+warnings.filterwarnings("ignore", message=".*Instantiating model from pre-trained.*")
+warnings.filterwarnings("ignore", message=".*Tokenizer.*initialized.*")
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -38,7 +63,7 @@ from models.inference import (
     GigaAMModel,
     VibeVoiceModel,
     Gemma3nModel,
-    Gemma4Model,
+    Phi4Model,
     NeMoConformerModel,
     SileroSTTModel,
     create_models,
@@ -50,9 +75,52 @@ from scripts.evaluate import (
     save_results,
 )
 
+import os as _os
+import warnings as _warnings
+# Reduce noisy progress bars / third-party log spam
+_os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+_os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+_os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# Suppress NeMo's print-based logger BEFORE any nemo import
+_os.environ.setdefault("NEMO_LOGGING_LEVEL", "ERROR")  # silences [NeMo W/I ...] prints
+_os.environ.setdefault("NVTE_FRAMEWORK", "pytorch")    # suppress transformer engine noise
+
 # --- Logging ---------------------------------------------------
 logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
 logger = logging.getLogger("benchmark")
+
+# Cut down on noisy but harmless warnings
+_warnings.filterwarnings("ignore", message="The given buffer is not writable*")
+_warnings.filterwarnings("ignore", message="`torch_dtype` is deprecated*")
+_warnings.filterwarnings("ignore", message=".*is deprecated.*AutoImageProcessor.*")
+_warnings.filterwarnings("ignore", message=".*is deprecated.*AutoFeatureExtractor.*")
+
+# Make logging play nicely with tqdm (avoid breaking progress bars)
+class _TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            pass
+
+_root = logging.getLogger()
+for _h in list(_root.handlers):
+    _root.removeHandler(_h)
+_tqdm_handler = _TqdmLoggingHandler()
+_tqdm_handler.setLevel(logging.getLevelName(config.LOG_LEVEL))
+_tqdm_handler.setFormatter(logging.Formatter(config.LOG_FORMAT))
+_root.addHandler(_tqdm_handler)
+_root.setLevel(logging.getLevelName(config.LOG_LEVEL))
+
+# Silence chatty third-party loggers (per-sample spam)
+# Use ERROR level (not WARNING) to suppress NeMo's dataloader/pretokenize warnings
+for _noisy in config.QUIET_LOGGERS:
+    _lg = logging.getLogger(_noisy)
+    _lg.setLevel(logging.ERROR)
+    _lg.propagate = False  # prevent bubbling to root handler
+
 
 
 # --- Seed everything ------------------------------------------
@@ -335,6 +403,8 @@ def run_inference(
         total=total,
         desc=f"Inference [{model.name}]",
         unit="sample",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
     ):
         audio_path = row["audio_path"]
         ref_text = row["text"]
@@ -361,7 +431,8 @@ def run_inference(
             })
 
         except Exception as e:
-            logger.error(f"Error on {audio_path}: {e}")
+            import traceback as _tb
+            logger.error(f"Error on {audio_path}: {e}\n{_tb.format_exc()}")
             errors += 1
 
             # OOM recovery
@@ -510,8 +581,20 @@ def main():
         help="Skip data preparation step"
     )
     parser.add_argument(
-        "--models", type=str, default="whisper",
-        help="Comma-separated model families: whisper,gigaam,vibevoice,gemma,gemma4,nemo,silero (default: whisper)"
+        "--refresh-data", action="store_true",
+        help="Force re-download and re-prepare dataset even if manifest exists"
+    )
+    parser.add_argument(
+        "--models", type=str, default="whisper,gigaam,nemo",
+        help=(
+            "Comma-separated model families to benchmark.\n"
+            "Available: whisper, phi4, gigaam, silero, nemo, vibevoice, vibevoice_4bit, gemma, gemma4\n"
+            "Default: whisper,gigaam,nemo\n"
+            "Models that fail to load (missing install) are skipped automatically.\n"
+            "Note: vibevoice requires transformers from source (pip install git+https://github.com/huggingface/transformers.git)\n"
+            "Note: silero has decoder issues, use with caution\n"
+            "Note: phi4 has meta-tensor issues with PyTorch 2.6, may require PyTorch 2.5.1"
+        )
     )
     parser.add_argument(
         "--split", type=str, default="test",
@@ -540,6 +623,23 @@ def main():
             "clean,noise_20db,noise_10db,speed_0.95,speed_1.05,gain_-6db,lowpass_4000"
         ),
     )
+    parser.add_argument(
+        "--custom-dataset", type=Path, default=None,
+        metavar="AUDIO_DIR",
+        help=(
+            "Path to a directory of your own audio files (WAV/MP3/FLAC/OGG/M4A/OPUS). "
+            "Bypasses HuggingFace download entirely. "
+            "Automatically sets --split custom and --skip-data-prep."
+        )
+    )
+    parser.add_argument(
+        "--custom-transcripts", type=Path, default=None,
+        metavar="TRANSCRIPTS_FILE",
+        help=(
+            "Optional: CSV/TSV/JSONL file with transcripts for --custom-dataset. "
+            "Columns: filename (or audio_path/file) + text (or transcript/sentence)."
+        )
+    )
     args = parser.parse_args()
 
     set_seed()
@@ -557,10 +657,34 @@ def main():
     else:
         logger.warning("No GPU detected! Running on CPU (will be very slow)")
 
-    # --- Step 1: Auto-download & prepare data -------------
-    if not args.skip_data_prep:
+    # --- Step 1: Prepare data --------------------------------
+    # Path A: user's own audio dir  (--custom-dataset)
+    # Path B: HuggingFace download  (default)
+    if args.custom_dataset:
+        from scripts.prepare_custom_data import prepare_custom_data
+        split_name = "custom"
+        args.split = split_name
+        manifest_path = config.PROCESSED_DIR / f"{split_name}_manifest.csv"
+        if not manifest_path.exists() or args.refresh_data:
+            if args.refresh_data and manifest_path.exists():
+                manifest_path.unlink()
+            prepare_custom_data(
+                audio_dir=args.custom_dataset,
+                transcript_path=args.custom_transcripts,
+                max_samples=args.max_samples,
+                split_name=split_name,
+            )
+        else:
+            logger.info(f"Custom dataset manifest already exists: {manifest_path}")
+            logger.info("Use --refresh-data to re-import.")
+
+    elif not args.skip_data_prep:
         manifest_path = config.PROCESSED_DIR / f"{args.split}_manifest.csv"
-        if not manifest_path.exists():
+        need_prep = not manifest_path.exists() or args.refresh_data
+        if args.refresh_data and manifest_path.exists():
+            logger.info("--refresh-data: removing old manifest and re-preparing...")
+            manifest_path.unlink()
+        if need_prep:
             logger.info("Data not found - downloading and preparing automatically...")
             if args.max_samples and args.split == "test":
                 config.MAX_TEST_SAMPLES = min(config.MAX_TEST_SAMPLES or args.max_samples, args.max_samples)
@@ -568,6 +692,7 @@ def main():
             prepare_common_voice()
         else:
             logger.info(f"Data already prepared: {manifest_path}")
+
     else:
         logger.info("Skipping data preparation (--skip-data-prep)")
 
@@ -614,8 +739,9 @@ def main():
         include_whisper="whisper" in model_families,
         include_gigaam="gigaam" in model_families,
         include_vibevoice="vibevoice" in model_families,
+        include_vibevoice_4bit="vibevoice_4bit" in model_families,
         include_gemma="gemma" in model_families,
-        include_gemma4="gemma4" in model_families,
+        include_phi4="phi4" in model_families,
         include_nemo="nemo" in model_families,
         include_silero="silero" in model_families,
         whisper_configs=whisper_configs,
@@ -706,8 +832,9 @@ def main():
 
         except Exception as e:
             logger.error(f"Failed to benchmark {model.name}: {e}")
-            import traceback
-            traceback.print_exc()
+            if str(config.LOG_LEVEL).upper() == "DEBUG":
+                import traceback
+                traceback.print_exc()
 
         finally:
             # Unload model to free VRAM

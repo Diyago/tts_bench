@@ -147,17 +147,35 @@ def decode_audio_feature(audio_data: dict) -> tuple[np.ndarray, int]:
     raise ValueError("Unsupported audio feature: expected decoded array, bytes, or path")
 
 
+def _load_ds(ds_id, lang, split):
+    """Load a dataset split, respecting HF_ENDPOINT for mirrors."""
+    import os
+    from datasets import load_dataset
+    kwargs = {"split": split}
+    if lang:
+        return load_dataset(ds_id, lang, **kwargs)
+    return load_dataset(ds_id, **kwargs)
+
+
 def prepare_common_voice():
     """
     Download and prepare Common Voice Russian dataset.
     Tries DATASET_NAME first, then each entry in DATASET_FALLBACKS.
+
+    Tip: if HuggingFace is blocked, set HF_ENDPOINT to a mirror:
+        set HF_ENDPOINT=https://hf-mirror.com
     Creates test and dev manifests.
     """
+    import os
     logger.info("=" * 60)
     logger.info("Preparing Common Voice Russian dataset")
     logger.info("=" * 60)
 
-    from datasets import Audio, load_dataset
+    hf_endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+    if hf_endpoint != "https://huggingface.co":
+        logger.info(f"Using HF mirror: {hf_endpoint}")
+
+    from datasets import Audio, concatenate_datasets
 
     text_field = "sentence"
     source_dataset = config.DATASET_NAME
@@ -166,49 +184,72 @@ def prepare_common_voice():
     # --- Primary dataset ---
     logger.info(f"Loading primary dataset: {config.DATASET_NAME}")
     try:
-        ds_test = load_dataset(config.DATASET_NAME, config.DATASET_LANG, split="test")
-        ds_dev  = load_dataset(config.DATASET_NAME, config.DATASET_LANG, split="validation")
+        ds_test = _load_ds(config.DATASET_NAME, config.DATASET_LANG, "test")
+        ds_dev  = _load_ds(config.DATASET_NAME, config.DATASET_LANG, "validation")
         logger.info(f"Primary dataset loaded: test={len(ds_test)}, dev={len(ds_dev)}")
     except Exception as e:
-        logger.warning(f"Primary dataset failed: {e}")
+        logger.warning(f"Primary dataset failed: {type(e).__name__}: {e}")
+        logger.info(
+            "TIP: If HuggingFace is unreachable, set HF_ENDPOINT to a mirror:\n"
+            "     set HF_ENDPOINT=https://hf-mirror.com"
+        )
 
     # --- Fallback chain ---
     if ds_test is None:
         for ds_id, ds_lang, ds_text_field in config.DATASET_FALLBACKS:
             logger.info(f"Trying fallback: {ds_id}")
             try:
-                kwargs = {"split": "test"}
-                if ds_lang:
-                    ds_test = load_dataset(ds_id, ds_lang, split="test")
-                    ds_dev  = load_dataset(ds_id, ds_lang, split="validation")
-                else:
-                    ds_test = load_dataset(ds_id, split="test")
+                splits_collected = []
+                for split in ["test", "validation", "train"]:
                     try:
-                        ds_dev = load_dataset(ds_id, split="validation")
+                        s = _load_ds(ds_id, ds_lang, split)
+                        splits_collected.append(s)
+                        logger.info(f"  {ds_id}/{split}: {len(s)} samples")
+                        # Stop collecting splits when we have enough
+                        total_so_far = sum(len(x) for x in splits_collected)
+                        if total_so_far >= (config.MAX_TEST_SAMPLES or 500) * 1.5:
+                            break
                     except Exception:
-                        ds_dev = ds_test  # use test as dev fallback
+                        pass  # split doesn't exist
+
+                if not splits_collected:
+                    raise RuntimeError(f"No splits found in {ds_id}")
+
+                # Combine all collected splits into one pool
+                combined = concatenate_datasets(splits_collected)
+                combined = combined.shuffle(seed=config.SEED)
+                # Split 80/20 into test/dev from the combined pool
+                split_idx = max(1, int(len(combined) * 0.8))
+                ds_test = combined.select(range(split_idx))
+                ds_dev  = combined.select(range(split_idx, len(combined)))
+
                 text_field = ds_text_field
                 source_dataset = ds_id
                 logger.info(
                     f"Fallback OK [{ds_id}]: "
+                    f"combined {len(combined)} samples → "
                     f"test={len(ds_test)}, dev={len(ds_dev)}"
                 )
                 logger.warning(
                     "DATA QUALITY WARNING: Using fallback public dataset "
-                    f"'{ds_id}'. Results may not generalise – "
-                    "domain is narrow (podcast speech). Consider a held-out "
-                    "private dataset for a production benchmark."
+                    f"'{ds_id}'. Domain is narrow (podcast speech). "
+                    "Results are a SMOKE TEST only, not a production benchmark."
                 )
                 break
             except Exception as e2:
-                logger.warning(f"Fallback {ds_id} failed: {e2}")
+                logger.warning(f"Fallback {ds_id} failed: {type(e2).__name__}: {e2}")
 
     if ds_test is None:
         raise RuntimeError(
-            "All dataset sources failed. Check your HF token or internet connection."
+            "All dataset sources failed.\n"
+            "Options:\n"
+            "  1. Set HF_ENDPOINT=https://hf-mirror.com and retry\n"
+            "  2. Set HF_HUB_OFFLINE=1 if data is already cached\n"
+            "  3. Place your own WAV files + manifest CSV in data/processed/"
         )
 
     logger.info(f"source_dataset={source_dataset}  text_field={text_field}")
+
 
     if "audio" in ds_test.column_names:
         ds_test = ds_test.cast_column("audio", Audio(decode=False))

@@ -55,30 +55,16 @@ def _compute_type(fp16: str = "float16", int8_fp16: str = "int8_float16") -> str
     return "int8"  # CPU-safe
 
 WHISPER_MODELS = {
+    # Best quality: large-v3 fp16, beam=5
     "whisper-large-v3": {
         "model_size": "large-v3",
         "compute_type": _compute_type("float16"),
-        "device": _DEVICE,
-        "beam_sizes": [1, 5],
-        "vad_filter": True,
-        "language": "ru",
-    },
-    "whisper-large-v3-int8": {
-        "model_size": "large-v3",
-        "compute_type": _compute_type("int8_float16"),
         "device": _DEVICE,
         "beam_sizes": [5],
         "vad_filter": True,
         "language": "ru",
     },
-    "whisper-medium": {
-        "model_size": "medium",
-        "compute_type": _compute_type("float16"),
-        "device": _DEVICE,
-        "beam_sizes": [1, 5],
-        "vad_filter": True,
-        "language": "ru",
-    },
+    # Best speed/quality trade-off: medium int8, beam=5
     "whisper-medium-int8": {
         "model_size": "medium",
         "compute_type": _compute_type("int8_float16"),
@@ -89,10 +75,21 @@ WHISPER_MODELS = {
     },
 }
 
-GIGAAM_CONFIG   = {"model_versions": ["v3_ctc", "v3_e2e_rnnt"], "device": _DEVICE}
+GIGAAM_CONFIG   = {"model_versions": ["ctc", "rnnt"], "device": _DEVICE}
 VIBEVOICE_CONFIG = {"model_path": "microsoft/VibeVoice-ASR", "device": _DEVICE, "use_4bit": True}
 GEMMA_CONFIG    = {"model_id": "google/gemma-3n-E4B-it",  "device": _DEVICE}
-GEMMA4_CONFIG   = {"model_id": "google/gemma-4-12b-it",   "device": _DEVICE, "use_4bit": True}
+PHI4_CONFIG     = {
+    "model_id": "microsoft/Phi-4-multimodal-instruct",
+    "device": _DEVICE,
+    # Keep VRAM under ~6 GB: prefer 4-bit quantization when available.
+    "use_4bit": True,
+}
+QWEN_CONFIG     = {
+    "model_id": "Qwen/Qwen2.5-Omni-3B",
+    "device": _DEVICE,
+    # Qwen2.5-Omni 3B is ~3B parameters, fits in ~4-5GB VRAM in bfloat16
+    "use_4bit": False,
+}
 NEMO_CONFIG     = {"model_names": ["stt_ru_conformer_ctc_large"], "device": _DEVICE}
 SILERO_CONFIG   = {"language": "ru", "device": _DEVICE}
 
@@ -110,8 +107,30 @@ ALLOWED_CHARS = set(
 
 # Ё→Е normalisation: ASR often outputs «е» where reference has «ё».
 # When True, both reference and hypothesis get ё→е before WER computation.
-NORMALIZE_YO_YE = True
+NORMALIZE_YO_YE = False
 
 # --- Logging ---------------------------------------------------
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
+
+# Third-party loggers that spam per-sample messages — set to WARNING
+QUIET_LOGGERS = [
+    "faster_whisper",       # "Processing audio..." / "VAD filter removed..."
+    "speechbrain",          # SpeechBrain progress bars
+    "transformers",         # model loading verbosity
+    "huggingface_hub",      # download progress
+    "nemo_logging",         # NeMo internal logger
+    "nemo",                 # NeMo top-level
+    "nemo.collections",     # NeMo collections
+    "nemo.collections.asr", # NeMo ASR module
+    "nemo.utils",           # NeMo utils
+    "nemo.core",            # NeMo core
+    "lhotse",               # Lhotse dataloader spam
+    "lhotse.cut",           # Lhotse cut spam
+    "lhotse.dataset",       # Lhotse dataset spam
+    "nv_one_logger",        # NVIDIA telemetry spam
+    "nv_one_logger.api.config",
+    "nv_one_logger.exporter.export_config_manager",
+    "nv_one_logger.training_telemetry.api.training_telemetry_provider",
+    "root",                 # NeMo dataloader "Initializing Lhotse CutSet..." messages
+]

@@ -1,0 +1,6 @@
+model_name,augmentation,count,wer_corpus,wer_mean_per_sample,cer_mean,rtf_mean
+gigaam_ctc,clean,65,0.0797,0.0797,0.051,0.0051
+gigaam_rnnt,clean,65,0.081,0.081,0.051,0.0245
+nemo_conformer-ctc-large,clean,65,0.1436,0.1436,0.0684,0.0065
+whisper-large-v3_beam5,clean,65,0.072,0.072,0.0404,0.0694
+whisper-medium-int8_beam5,clean,65,0.0788,0.0788,0.0369,0.0606

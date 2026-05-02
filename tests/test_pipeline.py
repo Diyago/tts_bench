@@ -413,9 +413,9 @@ class TestConfig:
         assert config.MAX_DURATION_SEC > config.MIN_DURATION_SEC
 
     def test_model_configs_exist(self):
-        assert "v3_ctc" in config.GIGAAM_CONFIG["model_versions"]
+        assert "ctc" in config.GIGAAM_CONFIG["model_versions"]
         assert config.VIBEVOICE_CONFIG["model_path"]
-        assert config.GEMMA4_CONFIG["model_id"]
+        assert config.PHI4_CONFIG["model_id"]
         assert len(config.NEMO_CONFIG["model_names"]) > 0
         assert config.SILERO_CONFIG["language"] == "ru"
 
@@ -446,7 +446,7 @@ class TestModelFactory:
             ASRModel,
             FasterWhisperModel,
             Gemma3nModel,
-            Gemma4Model,
+            Phi4Model,
             GigaAMModel,
             InferenceResult,
             NeMoConformerModel,
@@ -456,10 +456,10 @@ class TestModelFactory:
 
         model_instances = [
             FasterWhisperModel(name="test_whisper", device="cpu"),
-            GigaAMModel(name="test_gigaam", model_version="v3_ctc", device="cpu"),
+            GigaAMModel(name="test_gigaam", model_version="ctc", device="cpu"),
             VibeVoiceModel(name="test_vibe", device="cpu", use_4bit=True),
             Gemma3nModel(name="test_gemma", model_id="google/gemma-3n-E4B-it", device="cpu"),
-            Gemma4Model(name="test_gemma4", model_id="google/gemma-4-12b-it", device="cpu"),
+            Phi4Model(name="test_phi4", model_id="microsoft/Phi-4-multimodal-instruct", device="cpu"),
             NeMoConformerModel(name="test_nemo", model_name="stt_ru_conformer_ctc_large", device="cpu"),
             SileroSTTModel(name="test_silero", language="ru", device="cpu"),
         ]

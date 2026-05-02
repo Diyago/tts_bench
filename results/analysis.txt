@@ -1,0 +1,15 @@
+ASR Benchmark Analysis
+========================================
+
+Best quality: whisper-large-v3_beam5 (WER=0.0753)
+Fastest: gigaam_ctc (RTF=0.0050)
+
+Total benchmark wall time: 227.03 sec
+Audio augmentations: clean
+
+Full results:
+  whisper-large-v3_beam5                   WER=0.0753  CER=0.0433  RTF=0.0657  WALL=83.78s  GPU=6353MB
+  whisper-medium-int8_beam5                WER=0.0831  CER=0.0391  RTF=0.0578  WALL=74.82s  GPU=3506MB
+  gigaam_rnnt                              WER=0.0854  CER=0.0549  RTF=0.0245  WALL=32.72s  GPU=3571MB
+  gigaam_ctc                               WER=0.0861  CER=0.0555  RTF=0.0050  WALL=8.79s  GPU=3036MB
+  nemo_conformer-ctc-large                 WER=0.1443  CER=0.0710  RTF=0.0056  WALL=15.12s  GPU=4050MB
