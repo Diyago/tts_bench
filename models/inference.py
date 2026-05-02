@@ -477,7 +477,7 @@ class VibeVoiceModel(ASRModel):
     def __init__(
         self,
         name: str = "vibevoice_asr",
-        model_path: str = "microsoft/VibeVoice-ASR",
+        model_path: str = "microsoft/VibeVoice-ASR-HF",
         device: str = "cuda",
         use_4bit: bool = True,  # quantize to fit 12GB VRAM
     ):
@@ -540,44 +540,36 @@ class VibeVoiceModel(ASRModel):
             raise
 
     def _transcribe_single(self, audio_path: str) -> str:
-        import re
-        import torchaudio
-
-        # Load audio
-        waveform, sr = torchaudio.load(audio_path)
-        if sr != 16000:
-            waveform = torchaudio.functional.resample(waveform, sr, 16000)
-
-        # Prepare input
-        inputs = self._processor(
-            audio=waveform.squeeze().numpy(),
-            sampling_rate=16000,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        # Prepare inputs
+        inputs = self._processor.apply_transcription_request(audio=audio_path)
+        inputs = {k: v.to(self._model.device, self._model.dtype) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v.to(self._model.device) for k, v in inputs.items()}
 
         # Generate
         with torch.inference_mode():
-            outputs = self._model.generate(
-                **inputs,
-                max_new_tokens=512,
-                do_sample=False,
-            )
+            output_ids = self._model.generate(**inputs)
 
-        # Decode
-        raw_text = self._processor.decode(outputs[0], skip_special_tokens=True)
+        # Extract only the generated transcription tokens
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
 
-        # VibeVoice produces structured output with speaker/timestamp tags.
-        # Extract just the spoken content.
-        # Pattern: [Speaker X] [00:00.000 --> 00:05.000] Text content
+        # Decode to get structured output
+        transcription = self._processor.decode(generated_ids, return_format="parsed")[0]
+        
+        # Extract just the spoken content (What)
         text_parts = []
-        for line in raw_text.strip().split("\n"):
-            # Remove speaker and timestamp tags
-            cleaned = re.sub(r"\[.*?\]", "", line).strip()
-            if cleaned:
-                text_parts.append(cleaned)
-
-        return " ".join(text_parts) if text_parts else raw_text
+        if isinstance(transcription, list):
+            for segment in transcription:
+                if isinstance(segment, dict) and "What" in segment:
+                    text_parts.append(segment["What"])
+                elif isinstance(segment, str):
+                    text_parts.append(segment)
+        elif isinstance(transcription, str):
+            import re
+            for line in transcription.strip().split("\n"):
+                cleaned = re.sub(r"\[.*?\]", "", line).strip()
+                if cleaned:
+                    text_parts.append(cleaned)
+                    
+        return " ".join(text_parts).strip()
 
     def unload(self):
         del self._model
@@ -1298,9 +1290,26 @@ class QwenModel(ASRModel):
 
     def load(self):
         try:
-            from transformers import AutoProcessor, AutoModel
+            from transformers import AutoProcessor, AutoModelForCausalLM
+            
+            # For Qwen2.5-Omni, HF requires specific native classes in recent transformers
+            ModelClass = AutoModelForCausalLM
+            ProcessorClass = AutoProcessor
+            
+            if "Omni" in self.model_id:
+                try:
+                    from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+                    ModelClass = Qwen2_5OmniForConditionalGeneration
+                    ProcessorClass = Qwen2_5OmniProcessor
+                except ImportError:
+                    # Fallback to try AutoModel
+                    try:
+                        from transformers import AutoModel
+                        ModelClass = AutoModel
+                    except ImportError:
+                        pass
 
-            logger.info(f"Loading Qwen Audio/Omni model: {self.model_id}")
+            logger.info(f"Loading Qwen Audio/Omni model: {self.model_id} via {ModelClass.__name__}")
 
             load_kwargs = {
                 "trust_remote_code": True,
@@ -1316,16 +1325,16 @@ class QwenModel(ASRModel):
             else:
                 load_kwargs["torch_dtype"] = torch.float16
 
-            self._processor = AutoProcessor.from_pretrained(
+            self._processor = ProcessorClass.from_pretrained(
                 self.model_id, trust_remote_code=True
             )
             
             try:
-                self._model = AutoModel.from_pretrained(
+                self._model = ModelClass.from_pretrained(
                     self.model_id, **load_kwargs
                 )
             except Exception as e:
-                logger.warning(f"AutoModel failed ({e}), trying AutoModelForCausalLM...")
+                logger.warning(f"{ModelClass.__name__} failed ({e}), trying AutoModelForCausalLM...")
                 from transformers import AutoModelForCausalLM
                 self._model = AutoModelForCausalLM.from_pretrained(
                     self.model_id, **load_kwargs

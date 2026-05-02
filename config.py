@@ -76,7 +76,7 @@ WHISPER_MODELS = {
 }
 
 GIGAAM_CONFIG   = {"model_versions": ["ctc", "rnnt"], "device": _DEVICE}
-VIBEVOICE_CONFIG = {"model_path": "microsoft/VibeVoice-ASR", "device": _DEVICE, "use_4bit": True}
+VIBEVOICE_CONFIG = {"model_path": "microsoft/VibeVoice-ASR-HF", "device": _DEVICE, "use_4bit": True}
 GEMMA_CONFIG    = {"model_id": "google/gemma-3n-E4B-it",  "device": _DEVICE}
 PHI4_CONFIG     = {
     "model_id": "microsoft/Phi-4-multimodal-instruct",
