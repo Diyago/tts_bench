@@ -85,9 +85,11 @@ PHI4_CONFIG     = {
     "use_4bit": True,
 }
 QWEN_CONFIG     = {
-    "model_id": "Qwen/Qwen2.5-Omni-3B",
+    "model_ids": [
+        "Qwen/Qwen2.5-Omni-7B",  # Assume they might want 7B omni
+        "Qwen/Qwen2.5-Omni-3B",  # Analog up to 4-5B
+    ],
     "device": _DEVICE,
-    # Qwen2.5-Omni 3B is ~3B parameters, fits in ~4-5GB VRAM in bfloat16
     "use_4bit": False,
 }
 NEMO_CONFIG     = {"model_names": ["stt_ru_conformer_ctc_large"], "device": _DEVICE}

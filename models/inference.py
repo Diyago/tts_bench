@@ -489,7 +489,7 @@ class VibeVoiceModel(ASRModel):
 
     def load(self):
         try:
-            from transformers import AutoModelForCausalLM, AutoProcessor
+            from transformers import AutoModel, AutoModelForCausalLM, AutoProcessor
             import re as _re
 
             logger.info(f"Loading VibeVoice-ASR: {self.model_path}")
@@ -509,12 +509,20 @@ class VibeVoiceModel(ASRModel):
             else:
                 load_kwargs["torch_dtype"] = torch.float16
 
-            self._model = AutoModelForCausalLM.from_pretrained(
-                self.model_path, **load_kwargs
-            )
             self._processor = AutoProcessor.from_pretrained(
                 self.model_path, trust_remote_code=True
             )
+            
+            try:
+                self._model = AutoModel.from_pretrained(
+                    self.model_path, **load_kwargs
+                )
+            except Exception as e:
+                logger.warning(f"AutoModel failed ({e}), trying AutoModelForCausalLM...")
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path, **load_kwargs
+                )
+                
             self._model.eval()
             self._is_loaded = True
             logger.info("VibeVoice-ASR loaded successfully")
@@ -805,19 +813,36 @@ class Phi4Model(ASRModel):
                     torch.set_default_dtype(torch.float32)
                 except Exception:
                     _has_set_default_dtype = False
+                    
+            # Safe monkey-patch for Tensor.item() to prevent meta tensor crash in Phi4 remote code
+            _orig_item = torch.Tensor.item
+            def _safe_item(self):
+                if getattr(self, "is_meta", False):
+                    return 0
+                return _orig_item(self)
+            
+            torch.Tensor.item = _safe_item
             
             try:
                 # Load without device_map first to avoid meta tensors
                 # Then manually move to target device
                 load_kwargs_no_map = {k: v for k, v in load_kwargs.items() if k != "device_map"}
-                self._model = AutoModelForCausalLM.from_pretrained(
-                    self.model_id, **load_kwargs_no_map
-                ).eval()
                 
-                # Move to target device manually
-                if torch.cuda.is_available() and self.device == "cuda":
-                    self._model = self._model.cuda()
+                # If using 4bit, we must use device_map="auto" and accept accelerate's meta tensors
+                # But our safe_item monkey-patch protects against the init crash
+                if self.use_4bit:
+                    self._model = AutoModelForCausalLM.from_pretrained(
+                        self.model_id, **load_kwargs
+                    ).eval()
+                else:
+                    self._model = AutoModelForCausalLM.from_pretrained(
+                        self.model_id, **load_kwargs_no_map
+                    ).eval()
+                    # Move to target device manually
+                    if torch.cuda.is_available() and self.device == "cuda":
+                        self._model = self._model.cuda()
             finally:
+                torch.Tensor.item = _orig_item  # remove monkey-patch
                 if callable(_set_default_device) and _orig_default is not None:
                     try:
                         _set_default_device(str(_orig_default))
@@ -831,7 +856,7 @@ class Phi4Model(ASRModel):
 
             # If we ended up on CPU, ensure weights are actually materialized there.
             # (When device_map isn't provided, HF loads to CPU by default.)
-            if not torch.cuda.is_available() or load_kwargs.get("device_map") != "cuda":
+            if not torch.cuda.is_available() or (load_kwargs.get("device_map") != "cuda" and not self.use_4bit):
                 self._model = self._model.to("cpu")
 
             self._generation_config = GenerationConfig.from_pretrained(self.model_id)
@@ -1248,6 +1273,100 @@ class SileroSTTModel(ASRModel):
 # ===============================================================
 # Factory: create all configured models
 # ===============================================================
+# ===============================================================
+# Qwen Omni/Audio (Alibaba)
+# ===============================================================
+
+class QwenModel(ASRModel):
+    """
+    Qwen Audio / Omni series.
+    Supports Qwen2-Audio, Qwen2.5-Omni, Qwen3-Omni.
+    """
+
+    def __init__(
+        self,
+        name: str = "qwen_audio",
+        model_id: str = "Qwen/Qwen2.5-Omni-3B",
+        device: str = "cuda",
+        use_4bit: bool = False,
+    ):
+        super().__init__(name, device)
+        self.model_id = model_id
+        self.use_4bit = use_4bit
+        self._model = None
+        self._processor = None
+
+    def load(self):
+        try:
+            from transformers import AutoProcessor, AutoModelForCausalLM
+
+            logger.info(f"Loading Qwen Audio/Omni model: {self.model_id}")
+
+            load_kwargs = {
+                "trust_remote_code": True,
+                "device_map": "auto",
+            }
+
+            if self.use_4bit:
+                from transformers import BitsAndBytesConfig
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+            else:
+                load_kwargs["torch_dtype"] = torch.float16
+
+            self._processor = AutoProcessor.from_pretrained(
+                self.model_id, trust_remote_code=True
+            )
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.model_id, **load_kwargs
+            )
+            self._model.eval()
+            self._is_loaded = True
+            logger.info(f"{self.model_id} loaded successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to load Qwen model: {e}")
+            raise
+
+    def _transcribe_single(self, audio_path: str) -> str:
+        import librosa
+
+        sr = getattr(self._processor.feature_extractor, "sampling_rate", 16000)
+        audio_data, _ = librosa.load(audio_path, sr=sr)
+
+        conversation = [
+            {"role": "user", "content": [
+                {"type": "audio", "audio_url": "audio.wav"},
+                {"type": "text", "text": "Transcribe the audio exactly as spoken in Russian. Output only the transcription."}
+            ]}
+        ]
+
+        text = self._processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+
+        inputs = self._processor(text=text, audios=[audio_data], return_tensors="pt", padding=True)
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+
+        with torch.inference_mode():
+            generate_ids = self._model.generate(
+                **inputs,
+                max_new_tokens=256,
+                do_sample=False,
+            )
+        
+        generate_ids = generate_ids[:, inputs["input_ids"].size(1):]
+        response = self._processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        return response.strip()
+
+    def unload(self):
+        del self._model
+        del self._processor
+        self._model = None
+        self._processor = None
+        super().unload()
+
+
 
 def create_models(
     include_whisper: bool = True,
@@ -1258,6 +1377,7 @@ def create_models(
     include_phi4: bool = False,
     include_nemo: bool = False,
     include_silero: bool = False,
+    include_qwen: bool = False,
     whisper_configs: Optional[dict] = None,
 ) -> list[ASRModel]:
     """
@@ -1395,5 +1515,23 @@ def create_models(
                 device=cfg.SILERO_CONFIG["device"],
             )
         )
+
+    # --- Qwen Omni/Audio ----------------------------------
+    if include_qwen:
+        model_ids = cfg.QWEN_CONFIG.get("model_ids", [])
+        if not model_ids and "model_id" in cfg.QWEN_CONFIG:
+            model_ids = [cfg.QWEN_CONFIG["model_id"]]
+            
+        for m_id in model_ids:
+            if not m_id: continue
+            safe_name = m_id.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+            models.append(
+                QwenModel(
+                    name=f"qwen_{safe_name}",
+                    model_id=m_id,
+                    device=cfg.QWEN_CONFIG.get("device", "cuda"),
+                    use_4bit=cfg.QWEN_CONFIG.get("use_4bit", False),
+                )
+            )
 
     return models

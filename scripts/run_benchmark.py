@@ -588,7 +588,7 @@ def main():
         "--models", type=str, default="whisper,gigaam,nemo",
         help=(
             "Comma-separated model families to benchmark.\n"
-            "Available: whisper, phi4, gigaam, silero, nemo, vibevoice, vibevoice_4bit, gemma, gemma4\n"
+            "Available: whisper, phi4, gigaam, silero, nemo, vibevoice, vibevoice_4bit, gemma, gemma4, qwen\n"
             "Default: whisper,gigaam,nemo\n"
             "Models that fail to load (missing install) are skipped automatically.\n"
             "Note: vibevoice requires transformers from source (pip install git+https://github.com/huggingface/transformers.git)\n"
@@ -744,6 +744,7 @@ def main():
         include_phi4="phi4" in model_families,
         include_nemo="nemo" in model_families,
         include_silero="silero" in model_families,
+        include_qwen="qwen" in model_families,
         whisper_configs=whisper_configs,
     )
 
