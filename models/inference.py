@@ -1475,7 +1475,7 @@ def create_models(
         models.append(
             VibeVoiceModel(
                 name="vibevoice_asr",
-                model_path="microsoft/VibeVoice-ASR",
+                model_path="microsoft/VibeVoice-ASR-HF",
                 device="cuda",
                 use_4bit=False,  # Full precision (needs ~14GB VRAM)
             )
@@ -1484,7 +1484,7 @@ def create_models(
         models.append(
             VibeVoiceModel(
                 name="vibevoice_asr_4bit",
-                model_path="microsoft/VibeVoice-ASR",
+                model_path="microsoft/VibeVoice-ASR-HF",
                 device="cuda",
                 use_4bit=True,  # 4-bit quant to fit ~6GB VRAM
             )
