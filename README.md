@@ -1,4 +1,4 @@
-﻿# ASR Benchmark - Russian Speech Recognition
+# ASR Benchmark - Russian Speech Recognition
 
 Локальный бенчмарк для сравнения моделей распознавания русской речи.
 Пайплайн работает с локальными моделями, без внешних ASR API.
@@ -16,6 +16,7 @@
 | Gemma 4 | google/gemma-4-12b-it, multimodal audio | ~8-10 GB | опционально |
 | NeMo Conformer | NVIDIA `stt_ru_conformer_ctc_large` | ~2-4 GB | опционально |
 | Silero STT | snakers4/silero-models через `torch.hub` | ~0.5-1 GB | опционально |
+| Qwen Omni / Audio | Qwen/Qwen2.5-Omni (3B/7B), multimodal audio | ~4-6 GB | опционально |
 
 KAME (Sakana AI) не включен в таблицу сравнения: это speech-to-speech модель на базе Moshi, она не возвращает текстовую транскрипцию и поэтому не подходит для WER/CER.
 
@@ -77,8 +78,11 @@ python scripts/run_benchmark.py --models whisper,nemo
 # Whisper + Silero STT
 python scripts/run_benchmark.py --models whisper,silero
 
+# Whisper + Qwen Omni
+python scripts/run_benchmark.py --models whisper,qwen
+
 # Все подключенные семейства моделей
-python scripts/run_benchmark.py --models whisper,gigaam,vibevoice,gemma,gemma4,nemo,silero
+python scripts/run_benchmark.py --models whisper,gigaam,vibevoice,phi4,gemma,gemma4,nemo,silero,qwen
 
 # Ограничить число сэмплов
 python scripts/run_benchmark.py --models whisper --max-samples 50
