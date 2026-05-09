@@ -29,6 +29,26 @@ from typing import Optional
 import numpy as np
 import torch
 
+# Transformers 5.x uses multi-threaded tensor materialization
+# (spawn_materialize with ThreadPoolExecutor) which segfaults on
+# Windows during large safetensors loading. Force single-threaded.
+try:
+    import transformers.core_model_loading as _cml
+    _orig_spawn = _cml.spawn_materialize
+    def _single_thread_spawn(thread_pool, tensor, device=None, dtype=None):
+        return _orig_spawn(None, tensor, device, dtype)
+    _cml.spawn_materialize = _single_thread_spawn
+except (ImportError, AttributeError):
+    pass
+
+# caching_allocator_warmup tries to allocate a huge contiguous block
+# which fails on Windows WDDM. Disable it.
+try:
+    import transformers.modeling_utils as _mu
+    _mu.caching_allocator_warmup = lambda *a, **kw: None
+except (ImportError, AttributeError):
+    pass
+
 logger = logging.getLogger("models.inference")
 
 
@@ -488,65 +508,85 @@ class VibeVoiceModel(ASRModel):
         self._processor = None
 
     def load(self):
+        from transformers import AutoModel, AutoProcessor
+
+        logger.info(f"Loading VibeVoice-ASR: {self.model_path}")
+
+        # Transformers 5.x multi-threaded materialization segfaults on Windows.
         try:
-            from transformers import AutoModel, AutoModelForCausalLM, AutoProcessor
-            import re as _re
+            import transformers.core_model_loading as _cml
+            _orig_spawn = _cml.spawn_materialize
+            def _single_thread_spawn(thread_pool, tensor, device=None, dtype=None):
+                return _orig_spawn(None, tensor, device, dtype)
+            _cml.spawn_materialize = _single_thread_spawn
+        except (ImportError, AttributeError):
+            pass
 
-            logger.info(f"Loading VibeVoice-ASR: {self.model_path}")
+        self._processor = AutoProcessor.from_pretrained(
+            self.model_path, trust_remote_code=True
+        )
 
-            load_kwargs = {
-                "trust_remote_code": True,
-                "device_map": "auto",
-            }
-
-            if self.use_4bit:
-                from transformers import BitsAndBytesConfig
-                load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                )
-                logger.info("Using 4-bit quantization to fit 12GB VRAM")
-            else:
-                load_kwargs["torch_dtype"] = torch.float16
-
-            self._processor = AutoProcessor.from_pretrained(
-                self.model_path, trust_remote_code=True
-            )
-            
+        # Try 4-bit quantization on GPU first (~5GB VRAM).
+        if self.use_4bit and torch.cuda.is_available():
             try:
+                from transformers import BitsAndBytesConfig
                 self._model = AutoModel.from_pretrained(
-                    self.model_path, **load_kwargs
+                    self.model_path,
+                    trust_remote_code=True,
+                    device_map="auto",
+                    quantization_config=BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                    ),
                 )
+                self._model.eval()
+                self.device = "cuda"
+                self._is_loaded = True
+                self._record_load_memory()
+                logger.info(f"VibeVoice-ASR loaded (4-bit GPU)")
+                return
             except Exception as e:
-                logger.warning(f"AutoModel failed ({e}), trying AutoModelForCausalLM...")
-                self._model = AutoModelForCausalLM.from_pretrained(
-                    self.model_path, **load_kwargs
-                )
-                
-            self._model.eval()
-            self._is_loaded = True
-            logger.info("VibeVoice-ASR loaded successfully")
+                logger.warning(f"VibeVoice 4-bit GPU failed ({type(e).__name__}: {e}), falling back to CPU")
 
-        except ImportError as e:
-            logger.error(
-                f"VibeVoice dependencies missing: {e}\n"
-                "Install with:\n"
-                "  git clone https://github.com/microsoft/VibeVoice.git\n"
-                "  cd VibeVoice && pip install -e ."
-            )
-            raise
-        except Exception as e:
-            logger.error(f"Failed to load VibeVoice: {e}")
-            raise
+        # device_map="auto" may segfault on Windows; load to CPU.
+        self.device = "cpu"
+        self._model = AutoModel.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+            device_map={"": "cpu"},
+            use_safetensors=True,
+        )
+        self._model.eval()
+        self._is_loaded = True
+        logger.info(f"VibeVoice-ASR loaded successfully (CPU mode)")
 
     def _transcribe_single(self, audio_path: str) -> str:
-        # Prepare inputs
-        inputs = self._processor.apply_transcription_request(audio=audio_path)
-        inputs = {k: v.to(self._model.device, self._model.dtype) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v.to(self._model.device) for k, v in inputs.items()}
+        # Load audio ourselves to avoid torchcodec/librosa dependency issues.
+        # VibeVoice expects 24 kHz mono float32.
+        import soundfile as sf
+        target_sr = getattr(self._processor.feature_extractor, "sampling_rate", 24000)
+        audio_data, file_sr = sf.read(audio_path, dtype="float32")
+        if audio_data.ndim > 1:
+            audio_data = audio_data.mean(axis=1)
+        if file_sr != target_sr:
+            from scipy.signal import resample
+            num_samples = int(len(audio_data) * target_sr / file_sr)
+            audio_data = resample(audio_data, num_samples).astype(np.float32)
 
-        # Generate
-        with torch.inference_mode():
-            output_ids = self._model.generate(**inputs)
+        # Pass numpy array instead of path — skips torchcodec/librosa in processor.
+        inputs = self._processor.apply_transcription_request(audio=audio_data)
+        model_device = next(self._model.parameters()).device
+        model_dtype = next(self._model.parameters()).dtype
+        inputs = {k: v.to(model_device, model_dtype) if isinstance(v, torch.Tensor) and torch.is_floating_point(v) else v.to(model_device) for k, v in inputs.items()}
+
+        # Disable oneDNN to avoid "could not create a primitive" errors on Windows/CPU.
+        prev_mkldnn = torch.backends.mkldnn.enabled
+        torch.backends.mkldnn.enabled = False
+        try:
+            with torch.inference_mode():
+                output_ids = self._model.generate(**inputs)
+        finally:
+            torch.backends.mkldnn.enabled = prev_mkldnn
 
         # Extract only the generated transcription tokens
         generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
@@ -554,12 +594,12 @@ class VibeVoiceModel(ASRModel):
         # Decode to get structured output
         transcription = self._processor.decode(generated_ids, return_format="parsed")[0]
         
-        # Extract just the spoken content (What)
+        # Extract just the spoken content (Content or What)
         text_parts = []
         if isinstance(transcription, list):
             for segment in transcription:
-                if isinstance(segment, dict) and "What" in segment:
-                    text_parts.append(segment["What"])
+                if isinstance(segment, dict):
+                    text_parts.append(segment.get("Content", segment.get("What", "")))
                 elif isinstance(segment, str):
                     text_parts.append(segment)
         elif isinstance(transcription, str):
@@ -604,22 +644,65 @@ class Gemma3nModel(ASRModel):
         name: str = "gemma_3n_e4b",
         model_id: str = "google/gemma-3n-E4B-it",
         device: str = "cuda",
+        use_4bit: bool = False,
     ):
         super().__init__(name, device)
         self.model_id = model_id
+        self.use_4bit = use_4bit
         self._model = None
         self._processor = None
 
     def load(self):
         try:
             from transformers import AutoProcessor, Gemma3nForConditionalGeneration
+            import transformers.modeling_utils as _mu
 
+            import os
             logger.info(f"Loading Gemma 3n: {self.model_id}")
+
+            # Transformers 5.x multi-threaded materialization segfaults on Windows.
+            os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
+            try:
+                import transformers.core_model_loading as _cml
+                _orig_spawn = _cml.spawn_materialize
+                def _single_thread_spawn(thread_pool, tensor, device=None, dtype=None):
+                    return _orig_spawn(None, tensor, device, dtype)
+                _cml.spawn_materialize = _single_thread_spawn
+            except (ImportError, AttributeError):
+                pass
+
+            # Skip allocator warmup (causes OOM on small GPUs)
+            _orig_warmup = _mu.caching_allocator_warmup
+            _mu.caching_allocator_warmup = lambda *a, **k: None
+
+            kwargs = dict(
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+            )
+
+            if self.use_4bit and torch.cuda.is_available():
+                try:
+                    from transformers import BitsAndBytesConfig
+                    kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                    )
+                    logger.info("Gemma 3n: using 4-bit quantization")
+                except Exception as e:
+                    logger.warning(f"Gemma 3n 4-bit failed: {e}, using bfloat16 with CPU offload")
+
+            # On small GPUs, force CPU-only to avoid OOM during inference
+            # (accelerate hooks try to move offloaded layers to GPU on-demand)
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                if total_gb < 20:
+                    kwargs["device_map"] = {"": "cpu"}
+                    self.device = "cpu"
+                    logger.info(f"Gemma 3n: forcing CPU mode (GPU only {total_gb:.0f}GiB)")
 
             self._model = Gemma3nForConditionalGeneration.from_pretrained(
                 self.model_id,
-                device_map="auto",
-                torch_dtype=torch.bfloat16,
+                **kwargs,
             ).eval()
 
             self._processor = AutoProcessor.from_pretrained(self.model_id)
@@ -1271,16 +1354,21 @@ class SileroSTTModel(ASRModel):
 
 class QwenModel(ASRModel):
     """
-    Qwen Audio / Omni series.
-    Supports Qwen2-Audio, Qwen2.5-Omni, Qwen3-Omni.
+    Qwen2-Audio (Alibaba): audio understanding model for ASR.
+
+    Note: Qwen2.5-Omni is a speech-to-speech model and is NOT suitable for ASR
+    (its thinker outputs speech codec tokens, not text). Only Qwen2-Audio works.
+
+    Known issue: device_map="auto" segfaults on Windows + PyTorch 2.6 during
+    weight loading. Workaround: load to CPU first, then move layers to CUDA.
     """
 
     def __init__(
         self,
         name: str = "qwen_audio",
-        model_id: str = "Qwen/Qwen2.5-Omni-3B",
+        model_id: str = "Qwen/Qwen2-Audio-7B",
         device: str = "cuda",
-        use_4bit: bool = False,
+        use_4bit: bool = True,
     ):
         super().__init__(name, device)
         self.model_id = model_id
@@ -1289,81 +1377,62 @@ class QwenModel(ASRModel):
         self._processor = None
 
     def load(self):
+        from transformers import AutoProcessor, Qwen2AudioForConditionalGeneration
+
+        logger.info(f"Loading Qwen2-Audio model: {self.model_id}")
+
+        # Transformers 5.x uses multi-threaded tensor materialization
+        # (spawn_materialize with ThreadPoolExecutor) which segfaults on
+        # Windows during safetensors loading. Force single-threaded.
         try:
-            from transformers import AutoProcessor, AutoModelForCausalLM
-            
-            # For Qwen2.5-Omni, HF requires specific native classes in recent transformers
-            ModelClass = AutoModelForCausalLM
-            ProcessorClass = AutoProcessor
-            
-            if "Omni" in self.model_id:
-                try:
-                    from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
-                    ModelClass = Qwen2_5OmniForConditionalGeneration
-                    ProcessorClass = Qwen2_5OmniProcessor
-                except ImportError:
-                    # Fallback to try AutoModel
-                    try:
-                        from transformers import AutoModel
-                        ModelClass = AutoModel
-                    except ImportError:
-                        pass
+            import transformers.core_model_loading as _cml
+            _orig_spawn = _cml.spawn_materialize
+            def _single_thread_spawn(thread_pool, tensor, device=None, dtype=None):
+                return _orig_spawn(None, tensor, device, dtype)
+            _cml.spawn_materialize = _single_thread_spawn
+        except (ImportError, AttributeError):
+            pass
 
-            logger.info(f"Loading Qwen Audio/Omni model: {self.model_id} via {ModelClass.__name__}")
+        self._processor = AutoProcessor.from_pretrained(
+            self.model_id, trust_remote_code=True
+        )
 
-            load_kwargs = {
-                "trust_remote_code": True,
-                "device_map": "auto",
-            }
-
-            if self.use_4bit:
-                from transformers import BitsAndBytesConfig
-                load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                )
-            else:
-                load_kwargs["torch_dtype"] = torch.float16
-
-            self._processor = ProcessorClass.from_pretrained(
-                self.model_id, trust_remote_code=True
-            )
-            
-            try:
-                self._model = ModelClass.from_pretrained(
-                    self.model_id, **load_kwargs
-                )
-            except Exception as e:
-                logger.warning(f"{ModelClass.__name__} failed ({e}), trying AutoModelForCausalLM...")
-                from transformers import AutoModelForCausalLM
-                self._model = AutoModelForCausalLM.from_pretrained(
-                    self.model_id, **load_kwargs
-                )
-                
-            self._model.eval()
-            self._is_loaded = True
-            logger.info(f"{self.model_id} loaded successfully")
-
-        except Exception as e:
-            logger.error(f"Failed to load Qwen model: {e}")
-            raise
+        # device_map="auto" segfaults on Windows + PyTorch 2.6 during weight
+        # loading. Load to CPU in native dtype (float32).
+        self.device = "cpu"
+        self._model = Qwen2AudioForConditionalGeneration.from_pretrained(
+            self.model_id,
+            trust_remote_code=True,
+            device_map={"": "cpu"},
+            use_safetensors=True,
+        )
+        self._model.eval()
+        self._is_loaded = True
+        logger.info(f"{self.model_id} loaded (CPU)")
 
     def _transcribe_single(self, audio_path: str) -> str:
-        import librosa
+        import soundfile as sf
+        import numpy as np
 
         sr = getattr(self._processor.feature_extractor, "sampling_rate", 16000)
-        audio_data, _ = librosa.load(audio_path, sr=sr)
+        audio_data, file_sr = sf.read(audio_path, dtype="float32")
+        if audio_data.ndim > 1:
+            audio_data = audio_data.mean(axis=1)
+        if file_sr != sr:
+            from scipy.signal import resample
+            num_samples = int(len(audio_data) * sr / file_sr)
+            audio_data = resample(audio_data, num_samples).astype(np.float32)
 
         conversation = [
             {"role": "user", "content": [
-                {"type": "audio", "audio_url": "audio.wav"},
-                {"type": "text", "text": "Transcribe the audio exactly as spoken in Russian. Output only the transcription."}
+                {"type": "audio", "audio_url": "placeholder.wav"},
+                {"type": "text", "text": "Распознай речь на аудио и выпиши только транскрипцию, ничего лишнего."}
             ]}
         ]
 
         text = self._processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
 
-        inputs = self._processor(text=text, audios=[audio_data], return_tensors="pt", padding=True)
+        inputs = self._processor(text=text, audio=[audio_data], return_tensors="pt", sampling_rate=sr)
         inputs = {k: v.to(self._model.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
 
         with torch.inference_mode():
@@ -1371,11 +1440,29 @@ class QwenModel(ASRModel):
                 **inputs,
                 max_new_tokens=256,
                 do_sample=False,
+                repetition_penalty=1.1,
             )
-        
+
         generate_ids = generate_ids[:, inputs["input_ids"].size(1):]
         response = self._processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        return response.strip()
+        response = response.strip()
+        import re
+        # Strip SRT-style timestamps: 00:00,000 --> 00:02,340
+        response = re.sub(r"\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3}\s*-->\s*\d{0,2}:?\d{0,2}:?\d{0,2}[,\.]?\d{0,3}", "", response)
+        # Strip "Audio N,NNN:NNN --> N,NNN" style timestamps
+        response = re.sub(r"Audio\s+\d+[,.]?\d*[:\.]?\d*\s*(?:-->)?\s*\d*[,.]?\d*", "", response)
+        # Strip "Audio N:", "Audio N：", "Audio start", "Audio end", bare "Audio"
+        response = re.sub(r"(?:^|\s)Audio\s*(?:\d*[：:,.\s]|start|end|\b)", " ", response)
+        response = re.sub(r"\[Audio\s*\d*\]", "", response)
+        # Strip [Music], [noise], and similar tags
+        response = re.sub(r"\[[A-Za-z]+\]", "", response)
+        # Strip "assistant" (case-insensitive, model leaks system tokens)
+        response = re.sub(r"(?i)\bassistant\b", "", response)
+        # Strip Chinese/CJK characters
+        response = re.sub(r"[一-鿿　-〿＀-￯]+", "", response)
+        # Collapse whitespace
+        response = re.sub(r"\s+", " ", response).strip()
+        return response
 
     def unload(self):
         del self._model
@@ -1497,6 +1584,7 @@ def create_models(
                 name="gemma_3n_e4b",
                 model_id=cfg.GEMMA_CONFIG["model_id"],
                 device=cfg.GEMMA_CONFIG["device"],
+                use_4bit=cfg.GEMMA_CONFIG.get("use_4bit", False),
             )
         )
 

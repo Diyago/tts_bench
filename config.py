@@ -44,7 +44,7 @@ DATASET_FALLBACKS = [
     ("bond005/podlodka_speech", None, "transcription"),
 ]
 
-MAX_TEST_SAMPLES = 500
+MAX_TEST_SAMPLES = 1000
 MAX_DEV_SAMPLES = 100
 
 # --- Model configurations -------------------------------------
@@ -73,11 +73,20 @@ WHISPER_MODELS = {
         "vad_filter": True,
         "language": "ru",
     },
+    # Fast: small int8, beam=1 — competitive with gigaam_ctc speed
+    "whisper-small-int8": {
+        "model_size": "small",
+        "compute_type": _compute_type("int8_float16"),
+        "device": _DEVICE,
+        "beam_sizes": [1],
+        "vad_filter": True,
+        "language": "ru",
+    },
 }
 
 GIGAAM_CONFIG   = {"model_versions": ["ctc", "rnnt"], "device": _DEVICE}
 VIBEVOICE_CONFIG = {"model_path": "microsoft/VibeVoice-ASR-HF", "device": _DEVICE, "use_4bit": True}
-GEMMA_CONFIG    = {"model_id": "google/gemma-3n-E4B-it",  "device": _DEVICE}
+GEMMA_CONFIG    = {"model_id": "google/gemma-3n-E4B-it",  "device": _DEVICE, "use_4bit": False}
 PHI4_CONFIG     = {
     "model_id": "microsoft/Phi-4-multimodal-instruct",
     "device": _DEVICE,
@@ -85,12 +94,12 @@ PHI4_CONFIG     = {
     "use_4bit": True,
 }
 QWEN_CONFIG     = {
+    # Qwen2-Audio is the ASR model. Qwen2.5-Omni is speech-to-speech (not ASR).
     "model_ids": [
-        "Qwen/Qwen2.5-Omni-7B",  # Assume they might want 7B omni
-        "Qwen/Qwen2.5-Omni-3B",  # Analog up to 4-5B
+        "Qwen/Qwen2-Audio-7B",
     ],
     "device": _DEVICE,
-    "use_4bit": False,
+    "use_4bit": True,  # 4-bit required: 7B model needs ~14GB in fp16, RTX 4070 Ti has 12GB
 }
 NEMO_CONFIG     = {"model_names": ["stt_ru_conformer_ctc_large"], "device": _DEVICE}
 SILERO_CONFIG   = {"language": "ru", "device": _DEVICE}

@@ -784,6 +784,22 @@ def main():
         try:
             model_wall_start = time.perf_counter()
 
+            # Check available RAM before loading large CPU models.
+            # 7B models (Qwen, VibeVoice) need ~15 GB free for bfloat16 weights.
+            try:
+                import psutil
+                avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+                needs_high_mem = any(k in model.name.lower() for k in ("qwen", "vibevoice"))
+                min_ram = 18.0 if needs_high_mem else 6.0
+                if avail_gb < min_ram:
+                    logger.warning(
+                        f"Low RAM ({avail_gb:.1f} GB free, need {min_ram:.0f} GB) — "
+                        f"skipping {model.name} to avoid paging/segfault."
+                    )
+                    continue
+            except ImportError:
+                pass
+
             # Load model
             load_start = time.perf_counter()
             model.load()
@@ -803,6 +819,7 @@ def main():
                 refs, hyps, durs, times, gpus, model.name
             )
             metrics.update({
+                "run_date": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "model_load_wall_sec": round(model_load_wall_sec, 2),
                 "warmup_wall_sec": round(timing["warmup_wall_sec"], 2),
                 "inference_wall_sec": round(timing["inference_wall_sec"], 2),
@@ -844,17 +861,19 @@ def main():
                 traceback.print_exc()
 
         finally:
-            # Unload model to free VRAM
+            # Unload model to free VRAM/RAM
             try:
                 model.unload()
             except Exception:
                 pass
-            gc.collect()
+            # Aggressive cleanup for large CPU models
+            for _ in range(3):
+                gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Brief pause between models
-        time.sleep(2)
+        # Pause between models to let OS reclaim memory
+        time.sleep(3)
 
     # --- Step 5: Save results (CSV + Excel) ---------------
     if all_metrics:
@@ -893,6 +912,7 @@ def main():
         with open(analysis_path, "w", encoding="utf-8") as f:
             f.write("ASR Benchmark Analysis\n")
             f.write("=" * 40 + "\n\n")
+            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             f.write(f"Best quality: {best_wer['model_name']} (WER={best_wer['wer']:.4f})\n")
             f.write(f"Fastest: {best_speed['model_name']} (RTF={best_speed['rtf']:.4f})\n\n")
             f.write(f"Total benchmark wall time: {benchmark_total_wall_sec:.2f} sec\n")

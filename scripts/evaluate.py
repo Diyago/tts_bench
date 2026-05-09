@@ -258,12 +258,19 @@ def save_results(
     df_agg = None
     df_samples = None
 
-    # --- CSV: Aggregated results --------------------------
+    # --- CSV: Aggregated results (append to history) ------
     if metrics_list:
         df_agg = pd.DataFrame(metrics_list)
         agg_path = output_dir / "results.csv"
+        if agg_path.exists():
+            try:
+                df_old = pd.read_csv(agg_path)
+                df_agg = pd.concat([df_old, df_agg], ignore_index=True)
+                logger.info(f"Appending to existing results ({len(df_old)} previous rows)")
+            except Exception as e:
+                logger.warning(f"Could not read previous results, overwriting: {e}")
         df_agg.to_csv(agg_path, index=False)
-        logger.info(f"Aggregated results saved: {agg_path}")
+        logger.info(f"Aggregated results saved: {agg_path} ({len(df_agg)} total rows)")
 
         # Pretty print
         print("\n" + "=" * 80)
@@ -271,7 +278,7 @@ def save_results(
         print("=" * 80)
         from tabulate import tabulate
         display_cols = [
-            "model_name", "wer", "cer", "rtf",
+            "model_name", "run_date", "wer", "cer", "rtf",
             "avg_latency_sec", "model_benchmark_wall_sec",
             "model_load_wall_sec", "inference_wall_sec", "gpu_memory_peak_mb",
             "substitution_rate", "deletion_rate", "insertion_rate",
@@ -280,12 +287,18 @@ def save_results(
         print(tabulate(df_agg[existing_cols], headers="keys", tablefmt="grid", showindex=False))
         print()
 
-    # --- CSV: Per-sample results --------------------------
+    # --- CSV: Per-sample results (append to history) ------
     if per_sample_dfs:
         df_samples = pd.concat(per_sample_dfs, ignore_index=True)
         samples_path = output_dir / "per_sample_results.csv"
+        if samples_path.exists():
+            try:
+                df_old_samples = pd.read_csv(samples_path)
+                df_samples = pd.concat([df_old_samples, df_samples], ignore_index=True)
+            except Exception:
+                pass
         df_samples.to_csv(samples_path, index=False)
-        logger.info(f"Per-sample results saved: {samples_path}")
+        logger.info(f"Per-sample results saved: {samples_path} ({len(df_samples)} total rows)")
 
         # --- CSV: by-augmentation summary -----------------
         if "augmentation" in df_samples.columns:
@@ -302,6 +315,12 @@ def save_results(
                 .round(4)
             )
             aug_path = output_dir / "by_augmentation.csv"
+            if aug_path.exists():
+                try:
+                    df_old_aug = pd.read_csv(aug_path)
+                    aug_summary = pd.concat([df_old_aug, aug_summary], ignore_index=True)
+                except Exception:
+                    pass
             aug_summary.to_csv(aug_path, index=False)
             logger.info(f"By-augmentation summary saved: {aug_path}")
 
