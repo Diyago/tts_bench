@@ -141,10 +141,50 @@ python -m pytest tests/ -v --tb=short
 
 ## Результаты
 
+### Сравнение моделей (Common Voice RU, ~65 сэмплов)
+
+| Модель | WER | CER | RTF | Latency (p50) |
+|--------|-----|-----|-----|---------------|
+| whisper-large-v3 (beam=5) | **7.5%** | **4.3%** | 0.054 | 0.94s |
+| gigaam_rnnt | 8.5% | 5.5% | 0.018 | 0.33s |
+| whisper-medium-int8 (beam=5) | 8.3% | 3.9% | 0.045 | 0.78s |
+| gigaam_ctc | 8.6% | 5.6% | **0.005** | **0.08s** |
+| vibevoice_asr_4bit | 11.1% | 5.9% | 0.269 | 4.52s |
+| whisper-small-int8 (beam=1) | 13.2% | 7.0% | 0.054 | 0.94s |
+| nemo_conformer-ctc-large | 14.4% | 7.1% | 0.005 | 0.07s |
+| gemma_3n_e4b | 14.9% | 6.8% | 1.310 | 22.39s |
+| qwen_qwen2_audio_7b | 60.3% | 52.0% | 1.100 | 21.11s |
+
+### LLM-постобработка (gemma3-chat через Ollama)
+
+После-обработка транскрипций через LLM для исправления ошибок распознавания:
+
+| Модель | WER | WER LLM | Δ | CER | CER LLM |
+|--------|-----|---------|---|-----|---------|
+| nemo_conformer-ctc-large | 14.4% | **12.7%** | **-11.9%** | 7.1% | 7.3% |
+| gigaam_rnnt | 8.5% | **8.0%** | **-6.7%** | 5.5% | **4.9%** |
+| whisper-small-int8_beam1 | 13.2% | **12.3%** | **-6.6%** | 7.0% | **6.7%** |
+| gigaam_ctc | 8.6% | 8.5% | -1.6% | 5.6% | **5.2%** |
+| whisper-large-v3_beam5 | 7.5% | 7.5% | 0.0% | 4.3% | **4.1%** |
+| whisper-medium-int8_beam5 | 8.3% | 8.3% | +0.4% | 3.9% | 4.2% |
+| vibevoice_asr_4bit | 11.1% | 11.3% | +1.6% | 5.9% | 6.5% |
+| gemma_3n_e4b | 14.9% | 15.1% | +1.2% | 6.8% | 7.2% |
+| qwen_qwen2_audio_7b | 60.3% | 63.2% | +4.7% | 52.0% | 54.5% |
+
+**Выводы:**
+- LLM-постобработка эффективна для моделей с умеренным WER (8-15%): nemo -11.9%, gigaam_rnnt -6.7%, whisper-small -6.6%.
+- Для уже качественных моделей (whisper-large 7.5%) эффект нулевой — LLM нечего исправлять.
+- Для слабых моделей (qwen 60%) LLM деградирует результат — слишком много ошибок, LLM добавляет шум.
+- CER улучшается стабильнее WER — LLM лучше исправляет отдельные символы, чем целые слова.
+- Словарная постобработка (транслитерация англицизмов) может дать дополнительный прирост.
+
+### Файлы результатов
+
 | Файл | Формат | Назначение |
 |------|--------|------------|
 | `results/results.csv` | CSV | агрегированные метрики по моделям |
 | `results/per_sample_results.csv` | CSV | подробные результаты по каждому аудиофайлу |
+| `results/llm_postprocess_results.csv` | CSV | per-sample результаты LLM-постобработки |
 | `results/benchmark_report.xlsx` | Excel | отчет с несколькими листами |
 | `results/analysis.txt` | TXT | краткий вывод по лучшей модели и скорости |
 | `results/figures/*.png` | PNG | графики качества, скорости и ошибок |
@@ -152,11 +192,13 @@ python -m pytest tests/ -v --tb=short
 
 Excel-отчет содержит:
 
-1. **Summary**: WER, CER, RTF, latency, GPU и error rates.
+1. **Summary**: WER, CER, RTF, latency, GPU, error rates + wer_llm/cer_llm.
 2. **Details**: reference, hypothesis, augmentation, WER/CER/RTF по каждому сэмплу.
 3. **Errors (worst)**: 100 худших распознаваний.
 4. **Correct**: примеры полностью совпавших транскрипций.
-5. **Per-model Stats**: accuracy, mean/median WER/CER/RTF.
+5. **Per-model Stats**: accuracy, mean/median WER/CER/RTF + wer_llm/cer_llm.
+6. **LLM Post-process**: сводка до/после LLM-постобработки по моделям.
+7. **bench results**: расширенная таблица — все поля + hypothesis_fixed, wer_llm, cer_llm.
 
 В `results.csv` дополнительно сохраняется wall-clock время:
 
@@ -165,6 +207,20 @@ Excel-отчет содержит:
 - `inference_wall_sec`: сколько занял inference-loop по всем сэмплам.
 - `model_benchmark_wall_sec`: общий wall time по модели.
 - `audio_augmentations`: список аудио-вариантов, использованных в прогоне.
+
+## LLM-постобработка
+
+После прогона бенчмарка можно исправить ошибки распознавания через LLM (требует запущенный Ollama):
+
+```bash
+# Установить Ollama и модель
+ollama pull gemma3-chat:latest
+
+# Постобработка всех моделей
+python scripts/llm_postprocess.py
+```
+
+Скрипт читает `per_sample_results.csv`, отправляет каждый hypothesis в LLM, пересчитывает WER/CER с тем же нормализатором что и основной бенчмарк, и обновляет `benchmark_report.xlsx` колонками `wer_llm`/`cer_llm`.
 
 ## Аугментации
 
@@ -195,7 +251,9 @@ tts/
 |   +-- __init__.py
 |   +-- prepare_data.py
 |   +-- run_benchmark.py
-|   L-- evaluate.py
+|   +-- evaluate.py
+|   +-- llm_postprocess.py
+|   L-- semantic_eval.py
 +-- tests/
 |   +-- __init__.py
 |   L-- test_pipeline.py
